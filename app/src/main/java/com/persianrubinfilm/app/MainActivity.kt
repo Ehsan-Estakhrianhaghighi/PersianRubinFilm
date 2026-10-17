@@ -2,6 +2,10 @@ package com.persianrubinfilm.app
 
 import android.os.Bundle
 import android.webkit.WebView
+import android.webkit.WebResourceResponse
+import android.webkit.CookieManager
+import android.webkit.URLUtil
+import java.io.ByteArrayInputStream
 import android.webkit.WebViewClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceError
@@ -13,8 +17,6 @@ import android.content.Intent
 import android.net.Uri
 import org.json.JSONObject
 import coil.request.ImageRequest
-import androidx.compose.ui.platform.LocalContext
-import java.net.URLDecoder
 import android.webkit.WebChromeClient
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -40,6 +42,8 @@ import androidx.compose.ui.viewinterop.AndroidView
 import coil.compose.AsyncImage
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.async
+import kotlinx.coroutines.sync.withPermit
 import org.jsoup.Jsoup
 import java.net.URI
 
@@ -77,9 +81,17 @@ private fun imageUrl(raw: String?, base: String): String? {
     return try { URI(base).resolve(value).toString().takeIf { it.startsWith("https://") || it.startsWith("http://") } }
     catch (_: Exception) { null }
 }
+private fun cssPoster(element: org.jsoup.nodes.Element?, base: String): String? {
+    if (element == null) return null
+    val style = element.attr("style")
+    val match = Regex("""url\(\s*['"]?([^'")]+)""", RegexOption.IGNORE_CASE).find(style)
+    return imageUrl(match?.groupValues?.getOrNull(1), base)
+        ?: imageUrl(element.attr("data-bg"), base)
+        ?: imageUrl(element.attr("data-background"), base)
+}
 private fun posterFrom(img: org.jsoup.nodes.Element?, base: String): String? {
     if (img == null) return null
-    for (attr in listOf("data-src", "data-lazy-src", "data-original", "data-image", "data-url", "src")) {
+    for (attr in listOf("data-src", "data-lazy-src", "data-original", "data-image", "data-url", "data-fallback-src", "src")) {
         imageUrl(img.attr(attr), base)?.let { return it }
     }
     for (attr in listOf("data-srcset", "srcset")) {
@@ -91,13 +103,32 @@ private fun posterFrom(img: org.jsoup.nodes.Element?, base: String): String? {
         }
         candidates.maxByOrNull { it.first }?.second?.let { return it }
     }
-    return null
+    return cssPoster(img, base)
 }
 private fun posterModel(context: android.content.Context, film: Film): Any? = film.poster?.let {
     ImageRequest.Builder(context).data(it).crossfade(true)
         .addHeader("Referer", HOME)
         .addHeader("User-Agent", "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120.0 Mobile Safari/537.36")
         .build()
+}
+private val blockedAdHosts = setOf(
+    "doubleclick.net", "googlesyndication.com", "googleadservices.com",
+    "adnxs.com", "popads.net", "popcash.net", "propellerads.com",
+    "onclickads.net", "exoclick.com", "trafficjunky.net"
+)
+private fun isAdHost(host: String?): Boolean {
+    val h = host?.lowercase() ?: return false
+    return blockedAdHosts.any { h == it || h.endsWith(".$it") }
+}
+private fun suppressPageOverlays(view: WebView) {
+    // Remove common ad overlays without touching video iframes or the player itself.
+    view.evaluateJavascript("""(function(){
+      if (document.getElementById('prf-overlay-style')) return;
+      var st=document.createElement('style'); st.id='prf-overlay-style';
+      st.textContent='[id^="popunder"], [class*="popunder"], [id*="popup-ad"], [class*="popup-ad"], [class*="ad-overlay"], [id*="ad-overlay"] {display:none!important;}';
+      (document.head||document.documentElement).appendChild(st);
+      document.querySelectorAll('a[target="_blank"]').forEach(function(a){a.removeAttribute('target')});
+    })();""", null)
 }
 private fun isAllowedNavigation(target: Uri, originalHost: String): Boolean {
     if (target.scheme != "https") return false
@@ -127,6 +158,9 @@ private suspend fun fetchCatalog(): List<Film> = withContext(Dispatchers.IO) {
             if (title.isBlank()) continue
             val img = link.selectFirst("img") ?: container?.selectFirst("img")
             val poster = posterFrom(img, doc.baseUri())
+                ?: posterFrom(container?.selectFirst("source[srcset], img[data-srcset]"), doc.baseUri())
+                ?: cssPoster(container?.selectFirst("[style*=background-image]"), doc.baseUri())
+                ?: cssPoster(container, doc.baseUri())
                 ?: imageUrl(container?.selectFirst("meta[property=og:image]")?.attr("content"), doc.baseUri())
             val nearby = container?.text().orEmpty()
             val type = if (nearby.contains("episode", true) || nearby.contains("season", true) ||
@@ -134,7 +168,28 @@ private suspend fun fetchCatalog(): List<Film> = withContext(Dispatchers.IO) {
             val old = results[href]
             if (old == null || (old.poster == null && poster != null)) results[href] = Film(title, href, poster, type)
         }
-        results.values.toList()
+        // If list markup omits posters, inspect individual public detail-page metadata.
+        // Bound concurrency and count to avoid flooding the source website.
+        val initial = results.values.toList()
+        kotlinx.coroutines.coroutineScope {
+            val gate = kotlinx.coroutines.sync.Semaphore(4)
+            initial.map { film ->
+                kotlinx.coroutines.async(Dispatchers.IO) {
+                    if (film.poster != null) film else gate.withPermit {
+                        try {
+                            val detail = Jsoup.connect(film.url)
+                                .userAgent("Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36")
+                                .referrer(HOME).timeout(8500).get()
+                            val meta = detail.selectFirst("meta[property=og:image], meta[name=twitter:image], link[rel=image_src]")
+                            val candidate = imageUrl(meta?.attr("content")?.ifBlank { meta.attr("href") }, detail.baseUri())
+                                ?: posterFrom(detail.selectFirst("article img, .entry-content img, img"), detail.baseUri())
+                                ?: cssPoster(detail.selectFirst("[style*=background-image]"), detail.baseUri())
+                            film.copy(poster = candidate)
+                        } catch (_: Exception) { film }
+                    }
+                }
+            }.map { it.await() }
+        }
     } catch (_: Exception) { emptyList() }
 }
 
@@ -202,11 +257,21 @@ private fun App() {
                             settings.javaScriptCanOpenWindowsAutomatically = false
                             settings.setSupportMultipleWindows(false)
                             settings.mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
+                            settings.setSupportMultipleWindows(false)
+                            settings.mediaPlaybackRequiresUserGesture = true
+                            CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
                             webChromeClient = object : WebChromeClient() {
                                 override fun onCreateWindow(view: WebView?, isDialog: Boolean,
                                     isUserGesture: Boolean, resultMsg: Message?): Boolean = false
                             }
                             webViewClient = object : WebViewClient() {
+                                override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
+                                    val url = request?.url ?: return null
+                                    if (isAdHost(url.host)) {
+                                        return WebResourceResponse("text/plain", "UTF-8", ByteArrayInputStream(ByteArray(0)))
+                                    }
+                                    return null
+                                }
                                 override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
                                     val requestUri = request?.url ?: return true
                                     if (!request.isForMainFrame) return false // embedded players can load their own frames
@@ -214,6 +279,7 @@ private fun App() {
                                 }
                                 override fun onPageFinished(view: WebView?, url: String?) {
                                     super.onPageFinished(view, url)
+                                    if (view != null) suppressPageOverlays(view)
                                     if (url != null && isAllowedNavigation(Uri.parse(url), Uri.parse(BASE).host ?: "www.diycraftsguide.com")) {
                                         val old = history[film.url]
                                         if (old != null && old.lastPage != url) {
