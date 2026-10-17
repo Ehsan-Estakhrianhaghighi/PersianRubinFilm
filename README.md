@@ -22,3 +22,13 @@ Open in Android Studio with Android SDK 35 and JDK 17, let Gradle sync, then **B
 - Favorites persist on the device; watch progress, seasons/episodes navigation, caching, paging, and full-screen player handling are future work.
 - Persian UI text is present, but full RTL layout and full localization are not yet implemented.
 - For production distribution, use a **signed release APK** rather than a debug APK; do not publish your signing key.
+
+
+## Version 0.2 changes
+- Expanded poster extraction for lazy-loaded image attributes and srcset; image requests include a site referer. Posters still depend on the source website exposing usable images.
+- Disables JavaScript-created popup windows and blocks top-level navigation to external domains. Embedded third-party player frames remain permitted; ads within a frame are not filtered.
+- Local History tab: last opened title, last visited first-party page, manual watched toggle, and remove-history action. No account required.
+- Exact episode numbers and video playback timestamps cannot be reliably extracted from arbitrary third-party players; History is page-level, not guaranteed playback resume.
+- Updated GitHub Actions workflow with the SDK setup fix.
+
+Build verification: source modified; a full Gradle/Android build has not been run in this environment. Build through GitHub Actions and inspect its log.
