@@ -1,6 +1,12 @@
 package com.persianrubinfilm.app
 
 import android.os.Bundle
+import androidx.activity.compose.BackHandler
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.unit.Dp
 import android.webkit.WebView
 import android.webkit.WebResourceResponse
 import android.webkit.CookieManager
@@ -114,22 +120,36 @@ private fun posterModel(context: android.content.Context, film: Film): Any? = fi
 private val blockedAdHosts = setOf(
     "doubleclick.net", "googlesyndication.com", "googleadservices.com",
     "adnxs.com", "popads.net", "popcash.net", "propellerads.com",
-    "onclickads.net", "exoclick.com", "trafficjunky.net"
+    "onclickads.net", "exoclick.com", "trafficjunky.net",
+    "adsterra.com", "ad-maven.com", "hilltopads.net", "clickadu.com",
+    "richads.com", "monetag.com", "popmyads.com", "revenuehits.com"
 )
 private fun isAdHost(host: String?): Boolean {
     val h = host?.lowercase() ?: return false
     return blockedAdHosts.any { h == it || h.endsWith(".$it") }
 }
 private fun suppressPageOverlays(view: WebView) {
-    // Remove common ad overlays without touching video iframes or the player itself.
+    // Only modify the top-level document; do not remove video frames or playback controls.
     view.evaluateJavascript("""(function(){
-      if (document.getElementById('prf-overlay-style')) return;
-      var st=document.createElement('style'); st.id='prf-overlay-style';
-      st.textContent='[id^="popunder"], [class*="popunder"], [id*="popup-ad"], [class*="popup-ad"], [class*="ad-overlay"], [id*="ad-overlay"] {display:none!important;}';
-      (document.head||document.documentElement).appendChild(st);
-      document.querySelectorAll('a[target="_blank"]').forEach(function(a){a.removeAttribute('target')});
+      if(window.__prfGuardInstalled)return; window.__prfGuardInstalled=true;
+      const css=document.createElement('style'); css.textContent=
+        '[id*="popunder" i],[class*="popunder" i],[id*="popup-ad" i],'+
+        '[class*="popup-ad" i],[class*="ad-overlay" i],[id*="ad-overlay" i],'+
+        '[class*="adsbygoogle" i] {display:none!important}';
+      (document.head||document.documentElement).appendChild(css);
+      // Capture unwanted external top-page link clicks, leaving same-site navigation alone.
+      document.addEventListener('click',function(e){
+        const a=e.target.closest&&e.target.closest('a[href]'); if(!a)return;
+        try {const dest=new URL(a.href,location.href);
+          const source=location.hostname.replace(/^www\./,'');
+          if(dest.hostname!==location.hostname && dest.hostname!==source &&
+             !dest.hostname.endsWith('.'+source)) { e.preventDefault();e.stopImmediatePropagation(); }
+        } catch(_){}
+      },true);
+      document.querySelectorAll('a[target="_blank"]').forEach(a=>a.removeAttribute('target'));
     })();""", null)
 }
+
 private fun isAllowedNavigation(target: Uri, originalHost: String): Boolean {
     if (target.scheme != "https") return false
     val host = target.host?.lowercase() ?: return false
@@ -141,35 +161,85 @@ private fun isAllowedNavigation(target: Uri, originalHost: String): Boolean {
 // Only public catalog metadata is read. Video URLs, DRM and cookies are not extracted.
 private suspend fun fetchCatalog(): List<Film> = withContext(Dispatchers.IO) {
     try {
-        val doc = Jsoup.connect(HOME).userAgent("PersianRubinFilm/0.1 (Android catalog client)")
-            .timeout(15000).get()
+        val doc = Jsoup.connect(HOME)
+            .userAgent("Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120 Safari/537.36")
+            .timeout(20000).get()
         val results = linkedMapOf<String, Film>()
-        // Catalog layouts differ: the title link may wrap the image, or sit beside it.
-        for (link in doc.select("h2 a[href], h3 a[href], .post a[href], article a[href], .entry-title a[href]")) {
+
+        fun save(link: org.jsoup.nodes.Element, category: String) {
             val href = link.absUrl("href")
-            if (!href.startsWith("$BASE/") || href == HOME || href.contains("#")) continue
-            val container = link.closest("article, .post, .post-item, .item, .entry, .card")
+            if (!href.startsWith("$BASE/") || href == HOME || '#' in href) return
+            val container = link.closest(".item, .movie, .film, .post, article, li, .card, .box")
                 ?: link.parent()?.parent() ?: link.parent()
-            val heading = link.closest("h2, h3, h4")
-            val title = (heading?.text()?.trim()?.takeIf { it.isNotBlank() }
-                ?: link.attr("title").trim().takeIf { it.isNotBlank() }
-                ?: link.text().trim().takeIf { it.isNotBlank() }
-                ?: container?.selectFirst("img[alt]")?.attr("alt")?.trim()).orEmpty()
-            if (title.isBlank()) continue
-            val img = link.selectFirst("img") ?: container?.selectFirst("img")
-            val poster = posterFrom(img, doc.baseUri())
-                ?: posterFrom(container?.selectFirst("source[srcset], img[data-srcset]"), doc.baseUri())
-                ?: cssPoster(container?.selectFirst("[style*=background-image]"), doc.baseUri())
-                ?: cssPoster(container, doc.baseUri())
-                ?: imageUrl(container?.selectFirst("meta[property=og:image]")?.attr("content"), doc.baseUri())
-            val nearby = container?.text().orEmpty()
-            val type = if (nearby.contains("episode", true) || nearby.contains("season", true) ||
-                nearby.contains("سریال") || title.contains("سریال")) "series" else "movie"
-            val old = results[href]
-            if (old == null || (old.poster == null && poster != null)) results[href] = Film(title, href, poster, type)
+            val image = link.selectFirst("img") ?: container?.selectFirst("img")
+            val title = link.attr("title").trim().ifEmpty { link.text().trim() }
+                .ifEmpty { image?.attr("alt")?.trim().orEmpty() }
+                .ifEmpty { container?.selectFirst("h2, h3, h4")?.text()?.trim().orEmpty() }
+            if (title.isBlank() || title.length > 160) return
+            val poster = posterFrom(image, doc.baseUri())
+                ?: posterFrom(container?.selectFirst("img, source[srcset]"), doc.baseUri())
+                ?: cssPoster(container?.selectFirst("[style*=background]"), doc.baseUri())
+            val current = results[href]
+            if (current == null || current.poster == null && poster != null ||
+                current.type != category && category == "series") {
+                results[href] = Film(title, href, poster ?: current?.poster, category)
+            }
         }
-        // If list markup omits posters, inspect individual public detail-page metadata.
-        // Bound concurrency and count to avoid flooding the source website.
+
+        // The site's home page has distinct Latest Movies / Latest TV Series areas.
+        // Read those sections first so TV shows are not mislabeled as movies.
+        var activeSection: String? = null
+        for (element in doc.getAllElements()) {
+            if (element.tagName().matches(Regex("h[1-4]"))) {
+                val title = element.text().trim().lowercase()
+                when {
+                    title == "latest tv series" || title == "latest series" -> activeSection = "series"
+                    title == "latest movies" || title == "movie suggestion" -> activeSection = "movie"
+                    title == "all tv channels" || title == "about" -> activeSection = null
+                }
+            }
+            if (element.tagName() != "a" || activeSection == null) continue
+            if (element.selectFirst("img") != null ||
+                element.parent()?.tagName() in listOf("h2", "h3", "h4") ||
+                element.selectFirst("h2, h3, h4") != null) {
+                save(element, activeSection)
+            }
+        }
+        // Fall back to structural parsing for pages with different heading/layout markup.
+        for (link in doc.select("article a[href], .post a[href], .item a[href], .card a[href], h2 a[href], h3 a[href]")) {
+            val container = link.closest("article, .post, .item, .card, li") ?: link.parent()
+            val sectionText = generateSequence(container) { it.parent() }.take(5)
+                .map { it.className().lowercase() + " " + it.id().lowercase() }.joinToString(" ")
+            val nearby = container?.text().orEmpty()
+            val category = if (sectionText.contains("serial") || sectionText.contains("series") ||
+                nearby.contains("episodes", true) || nearby.contains("season", true) ||
+                nearby.contains("سریال")) "series" else "movie"
+            save(link, category)
+        }
+        // Additional catalog is exposed on dedicated pages, especially TV series.
+        // Some sites use a different HTML structure for /serial.html.
+        for ((page, category) in listOf("$BASE/serial.html" to "series", "$BASE/movie.html" to "movie")) {
+            try {
+                val extra = Jsoup.connect(page).userAgent("Mozilla/5.0 (Android TV)")
+                    .referrer(HOME).timeout(12000).get()
+                for (link in extra.select("article a[href], .item a[href], .post a[href], .card a[href], h2 a[href], h3 a[href]")) {
+                    val href = link.absUrl("href")
+                    if (!href.startsWith("$BASE/") || href == HOME || '#' in href) continue
+                    val holder = link.closest("article, .item, .post, .card, li") ?: link.parent()
+                    val img = link.selectFirst("img") ?: holder?.selectFirst("img")
+                    val title = link.attr("title").ifBlank { link.text().trim() }
+                        .ifBlank { img?.attr("alt").orEmpty() }
+                    if (title.isBlank()) continue
+                    val poster = posterFrom(img, extra.baseUri())
+                        ?: cssPoster(holder?.selectFirst("[style*=background]"), extra.baseUri())
+                    val old = results[href]
+                    if (old == null || old.poster == null && poster != null || old.type != category) {
+                        results[href] = Film(title, href, poster ?: old?.poster, category)
+                    }
+                }
+            } catch (_: Exception) { /* Home page catalog can still be used. */ }
+        }
+        // Enrich missing images from individual public movie/series metadata.
         val initial = results.values.toList()
         kotlinx.coroutines.coroutineScope {
             val gate = kotlinx.coroutines.sync.Semaphore(4)
@@ -178,12 +248,11 @@ private suspend fun fetchCatalog(): List<Film> = withContext(Dispatchers.IO) {
                     if (film.poster != null) film else gate.withPermit {
                         try {
                             val detail = Jsoup.connect(film.url)
-                                .userAgent("Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36")
+                                .userAgent("Mozilla/5.0 (Android TV)")
                                 .referrer(HOME).timeout(8500).get()
                             val meta = detail.selectFirst("meta[property=og:image], meta[name=twitter:image], link[rel=image_src]")
                             val candidate = imageUrl(meta?.attr("content")?.ifBlank { meta.attr("href") }, detail.baseUri())
-                                ?: posterFrom(detail.selectFirst("article img, .entry-content img, img"), detail.baseUri())
-                                ?: cssPoster(detail.selectFirst("[style*=background-image]"), detail.baseUri())
+                                ?: posterFrom(detail.selectFirst(".poster img, .thumb img, article img, img"), detail.baseUri())
                             film.copy(poster = candidate)
                         } catch (_: Exception) { film }
                     }
@@ -203,11 +272,14 @@ class MainActivity : ComponentActivity() {
 @Composable
 private fun App() {
     val context = LocalContext.current
+    val isTv = remember { context.packageManager.hasSystemFeature("android.software.leanback") ||
+        context.packageManager.hasSystemFeature("android.hardware.type.television") }
     val prefs = remember { context.getSharedPreferences("settings", 0) }
     var persian by remember { mutableStateOf(prefs.getBoolean("persian", false)) }
     var tab by remember { mutableStateOf("home") }
     var query by remember { mutableStateOf("") }
     var selected by remember { mutableStateOf<Film?>(null) }
+    BackHandler(selected != null) { selected = null; resumeUrl = null }
     var catalog by remember { mutableStateOf<List<Film>>(emptyList()) }
     var loading by remember { mutableStateOf(true) }
     var history by remember { mutableStateOf(readHistory(prefs)) }
@@ -227,14 +299,14 @@ private fun App() {
         Column(Modifier.fillMaxSize().background(bg)) {
             Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween) {
-                Text("PersianRubinFilm", color = red, fontWeight = FontWeight.Bold, fontSize = 22.sp)
-                TextButton(onClick = { persian = !persian; prefs.edit().putBoolean("persian", persian).apply() }) {
+                Text("PersianRubinFilm", color = red, fontWeight = FontWeight.Bold, fontSize = if (isTv) 29.sp else 22.sp)
+                TextButton(modifier = Modifier.tvFocus(), onClick = { persian = !persian; prefs.edit().putBoolean("persian", persian).apply() }) {
                     Text(if (persian) "English" else "فارسی")
                 }
             }
             if (selected != null) {
                 val film = selected!!
-                TextButton(onClick = { selected = null; resumeUrl = null }) { Text(label("← Back", "بازگشت ←")) }
+                TextButton(modifier = Modifier.tvFocus(), onClick = { selected = null; resumeUrl = null }) { Text(label("← Back", "بازگشت ←")) }
                 Text(film.title, Modifier.padding(horizontal = 16.dp, vertical = 8.dp), color = Color.White, fontSize = 22.sp)
                 Text(label("Playback uses the source site's own page/player. Availability and permissions depend on the provider.",
                     "پخش از صفحه و پخش‌کنندهٔ سایت اصلی انجام می‌شود."), Modifier.padding(16.dp), color = Color.LightGray)
@@ -255,9 +327,10 @@ private fun App() {
                             settings.javaScriptEnabled = true
                             settings.domStorageEnabled = true
                             settings.javaScriptCanOpenWindowsAutomatically = false
+                            isFocusable = true
+                            isFocusableInTouchMode = true
                             settings.setSupportMultipleWindows(false)
                             settings.mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
-                            settings.setSupportMultipleWindows(false)
                             settings.mediaPlaybackRequiresUserGesture = true
                             CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
                             webChromeClient = object : WebChromeClient() {
@@ -295,12 +368,12 @@ private fun App() {
                 }
             } else {
                 OutlinedTextField(query, { query = it }, label = { Text(label("Search titles", "جستجوی فیلم و سریال")) },
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp), singleLine = true)
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp).tvFocus(), singleLine = true)
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
                     listOf("home" to label("Home", "خانه"), "history" to label("History", "تاریخچه"), "movie" to label("Movies", "فیلم‌ها"),
                         "series" to label("Series", "سریال‌ها"), "favorites" to label("My List", "فهرست من"))
-                        .forEach { (key, title) -> TextButton(onClick = { tab = key }) {
-                            Text(title, color = if (tab == key) red else Color.LightGray, fontSize = 12.sp)
+                        .forEach { (key, title) -> TextButton(modifier = Modifier.tvFocus(), onClick = { tab = key }) {
+                            Text(title, color = if (tab == key) red else Color.LightGray, fontSize = if (isTv) 18.sp else 12.sp)
                         } }
                 }
                 if (tab == "history") {
@@ -313,7 +386,7 @@ private fun App() {
                         items(recent) { entry ->
                             val film = Film(entry.title, entry.url, entry.poster, entry.type)
                             Row(Modifier.fillMaxWidth().padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
-                                Poster(film, Modifier.size(width = 76.dp, height = 105.dp).clickable { openFilm(film, true) })
+                                Poster(film, Modifier.size(width = 76.dp, height = 105.dp).tvFocus().clickable { openFilm(film, true) })
                                 Column(Modifier.weight(1f).padding(8.dp)) {
                                     Text(entry.title, color = Color.White, maxLines = 2)
                                     Text(if (entry.completed) label("Watched", "دیده‌شده") else label("Recently opened", "اخیراً بازشده"),
@@ -342,10 +415,10 @@ private fun App() {
                         if (tab == "home" && query.isBlank()) {
                             item { Text(label("Featured", "ویژه"), Modifier.padding(16.dp), color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.Bold) }
                             item { catalog.firstOrNull()?.let { film ->
-                                Column(Modifier.fillMaxWidth().clickable { openFilm(film) }.padding(horizontal = 16.dp)) {
+                                Column(Modifier.fillMaxWidth().tvFocus().clickable { openFilm(film) }.padding(horizontal = 16.dp)) {
                                     Poster(film, Modifier.fillMaxWidth().height(190.dp))
                                     Text(film.title, Modifier.padding(vertical = 8.dp), color = Color.White, fontSize = 20.sp)
-                                    Button(onClick = { openFilm(film) }) { Text(label("Watch", "تماشا")) }
+                                    Button(modifier = Modifier.tvFocus(), onClick = { openFilm(film) }) { Text(label("Watch", "تماشا")) }
                                 }
                             } }
                             for ((type, en, fa) in listOf(Triple("movie", "Movies", "فیلم‌ها"), Triple("series", "Series", "سریال‌ها"))) {
@@ -369,6 +442,14 @@ private fun App() {
     }
 }
 
+// Focus outline makes D-pad selection visible from a sofa distance.
+@Composable private fun Modifier.tvFocus(): Modifier {
+    var focused by remember { mutableStateOf(false) }
+    return this.onFocusChanged { focused = it.isFocused || it.hasFocus }
+        .border(if (focused) 3.dp else 0.dp, if (focused) Color.White else Color.Transparent,
+            RoundedCornerShape(8.dp))
+}
+
 @Composable private fun Poster(film: Film, modifier: Modifier) {
     val ctx = LocalContext.current
     Box(modifier.background(Color(0xFF30313B), RoundedCornerShape(8.dp)), contentAlignment = Alignment.Center) {
@@ -379,16 +460,19 @@ private fun App() {
 }
 
 @Composable private fun FilmCard(film: Film, saved: Boolean, onOpen: () -> Unit, onFavorite: () -> Unit) {
-    Column(Modifier.width(145.dp).padding(5.dp)) {
-        Poster(film, Modifier.fillMaxWidth().height(195.dp).clickable(onClick = onOpen))
-        Text(film.title, Modifier.clickable(onClick = onOpen).padding(top = 5.dp), color = Color.White, maxLines = 2, overflow = TextOverflow.Ellipsis)
-        TextButton(onClick = onFavorite) { Text(if (saved) "♥" else "+", color = red) }
+    val ctx = LocalContext.current
+    val tv = ctx.packageManager.hasSystemFeature("android.software.leanback") ||
+        ctx.packageManager.hasSystemFeature("android.hardware.type.television")
+    Column(Modifier.width(if (tv) 212.dp else 145.dp).padding(if (tv) 8.dp else 5.dp)) {
+        Poster(film, Modifier.fillMaxWidth().height(if (tv) 275.dp else 195.dp).tvFocus().clickable(onClick = onOpen))
+        Text(film.title, Modifier.tvFocus().clickable(onClick = onOpen).padding(top = 5.dp), color = Color.White, fontSize = if (tv) 18.sp else 14.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
+        TextButton(modifier = Modifier.tvFocus(), onClick = onFavorite) { Text(if (saved) "♥" else "+", color = red) }
     }
 }
 @Composable private fun FilmRow(film: Film, saved: Boolean, onOpen: () -> Unit, onFavorite: () -> Unit) {
-    Row(Modifier.fillMaxWidth().clickable(onClick = onOpen).padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
+    Row(Modifier.fillMaxWidth().tvFocus().clickable(onClick = onOpen).padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
         Poster(film, Modifier.size(width = 90.dp, height = 125.dp))
         Text(film.title, Modifier.weight(1f).padding(12.dp), color = Color.White)
-        TextButton(onClick = onFavorite) { Text(if (saved) "♥" else "+", color = red) }
+        TextButton(modifier = Modifier.tvFocus(), onClick = onFavorite) { Text(if (saved) "♥" else "+", color = red) }
     }
 }

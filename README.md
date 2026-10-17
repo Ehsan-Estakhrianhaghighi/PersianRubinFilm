@@ -32,3 +32,11 @@ Open in Android Studio with Android SDK 35 and JDK 17, let Gradle sync, then **B
 - Updated GitHub Actions workflow with the SDK setup fix.
 
 Build verification: source modified; a full Gradle/Android build has not been run in this environment. Build through GitHub Actions and inspect its log.
+
+
+## v0.5 Fire TV changes
+- Catalog categorizes listings using the source page's **Latest Movies** and **Latest TV Series** headings, with dedicated series/movie-page fallback.
+- Focus outlines and larger cards on Android TV; D-pad select opens a title, Back returns to catalog.
+- Declares Android TV launch support and touchscreen not required.
+- WebView filters several known advertising hosts, rejects unrelated top-level redirects, and prevents external top-page link clicks. Playback-host popups or ad overlays may still occur.
+- Install on an Android-based Fire TV device and test playback and D-pad controls; build/runtime testing has not been performed locally.
