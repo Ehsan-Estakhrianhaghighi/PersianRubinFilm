@@ -174,7 +174,7 @@ private suspend fun fetchCatalog(): List<Film> = withContext(Dispatchers.IO) {
         kotlinx.coroutines.coroutineScope {
             val gate = kotlinx.coroutines.sync.Semaphore(4)
             initial.map { film ->
-                kotlinx.coroutines.async(Dispatchers.IO) {
+                async(Dispatchers.IO) {
                     if (film.poster != null) film else gate.withPermit {
                         try {
                             val detail = Jsoup.connect(film.url)
