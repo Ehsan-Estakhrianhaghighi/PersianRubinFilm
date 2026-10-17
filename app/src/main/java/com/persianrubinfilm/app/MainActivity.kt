@@ -279,11 +279,11 @@ private fun App() {
     var tab by remember { mutableStateOf("home") }
     var query by remember { mutableStateOf("") }
     var selected by remember { mutableStateOf<Film?>(null) }
+    var resumeUrl by remember { mutableStateOf<String?>(null) }
     BackHandler(selected != null) { selected = null; resumeUrl = null }
     var catalog by remember { mutableStateOf<List<Film>>(emptyList()) }
     var loading by remember { mutableStateOf(true) }
     var history by remember { mutableStateOf(readHistory(prefs)) }
-    var resumeUrl by remember { mutableStateOf<String?>(null) }
     fun openFilm(film: Film, resume: Boolean = false) {
         resumeUrl = if (resume) history[film.url]?.lastPage else null
         selected = film
