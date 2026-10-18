@@ -6,7 +6,7 @@ plugins {
 android {
     namespace = "com.persianrubinfilm.app"
     compileSdk = 35
-    defaultConfig { applicationId = "com.persianrubinfilm.app"; minSdk = 24; targetSdk = 35; versionCode = 12; versionName = "0.10.2" }
+    defaultConfig { applicationId = "com.persianrubinfilm.app"; minSdk = 24; targetSdk = 35; versionCode = 13; versionName = "0.10.3" }
     buildFeatures { compose = true }
     compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
     kotlinOptions { jvmTarget = "17" }

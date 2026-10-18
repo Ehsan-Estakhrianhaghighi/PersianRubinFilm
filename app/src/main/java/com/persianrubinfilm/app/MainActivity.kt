@@ -40,6 +40,8 @@ import androidx.activity.compose.setContent
 import androidx.compose.foundation.*
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -580,6 +582,57 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
+private fun SafeEmbeddedPlayer(embedUrl: String, referer: String, modifier: Modifier = Modifier) {
+    val context = LocalContext.current
+    AndroidView(factory = { ctx ->
+                        TvCursorFrame(ctx).apply {
+                          (context as? MainActivity)?.attachCursor(this)
+                          browser.apply {
+                            settings.javaScriptEnabled = true
+                            settings.domStorageEnabled = true
+                            settings.loadsImagesAutomatically = true
+                            settings.javaScriptCanOpenWindowsAutomatically = false
+                            isFocusable = true
+                            isFocusableInTouchMode = true
+                            settings.setSupportMultipleWindows(false)
+                            settings.mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
+                            // Allows Play to start the embedded video without a second Android WebView gesture.
+                            settings.mediaPlaybackRequiresUserGesture = false
+                            CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+                            webChromeClient = object : WebChromeClient() {
+                                override fun onCreateWindow(view: WebView?, isDialog: Boolean,
+                                    isUserGesture: Boolean, resultMsg: Message?): Boolean = false
+                            }
+                            webViewClient = object : WebViewClient() {
+                                override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
+                                    val url = request?.url ?: return null
+                                    if (isAdHost(url.host)) {
+                                        return WebResourceResponse("text/plain", "UTF-8", ByteArrayInputStream(ByteArray(0)))
+                                    }
+                                    return null
+                                }
+                                override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                                    val requestUri = request?.url ?: return true
+                                    if (!request.isForMainFrame) return false // CDN/subframes needed for video.
+                                    return !isAllowedPlayerNavigation(requestUri, embedUrl)
+                                }
+                                override fun onPageFinished(view: WebView?, url: String?) {
+                                    super.onPageFinished(view, url)
+                                    // The host player is loaded directly; do not inject the source-site DOM/ad scripts.
+                                    view?.evaluateJavascript("""(function(){
+                                        var v=document.querySelector('video');
+                                        if(v){v.autoplay=true;var p=v.play();if(p&&p.catch)p.catch(function(){});}
+                                    })();""", null)
+                                }
+                            }
+                            loadUrl(embedUrl, mapOf("Referer" to referer))
+                          }
+                        }
+                    }, modifier = modifier,
+                    update = { (context as? MainActivity)?.attachCursor(it) })
+}
+
+@Composable
 private fun App() {
     val context = LocalContext.current
     val isTv = remember { context.packageManager.hasSystemFeature("android.software.leanback") ||
@@ -590,9 +643,11 @@ private fun App() {
     var query by remember { mutableStateOf("") }
     var selected by remember { mutableStateOf<Film?>(null) }
     var resumeUrl by remember { mutableStateOf<String?>(null) }
-    BackHandler(selected != null) {
+    var playerFullscreen by remember { mutableStateOf(false) }
+    BackHandler(playerFullscreen) { playerFullscreen = false }
+    BackHandler(selected != null && !playerFullscreen) {
         (context as? MainActivity)?.attachCursor(null)
-        selected = null; resumeUrl = null
+        selected = null; resumeUrl = null; playerFullscreen = false
     }
     var searchOpen by remember { mutableStateOf(false) }
     var episodes by remember { mutableStateOf<List<Episode>>(emptyList()) }
@@ -631,6 +686,7 @@ private fun App() {
     fun openFilm(film: Film, resume: Boolean = false) {
         resumeUrl = if (resume) history[film.url]?.lastPage else null
         playRequested = false
+        playerFullscreen = false
         (context as? MainActivity)?.attachCursor(null)
         selected = film
         val previous = history[film.url]
@@ -642,10 +698,22 @@ private fun App() {
     LaunchedEffect(Unit) { catalog = fetchCatalog(); loading = false }
     fun label(en: String, fa: String) = if (persian) fa else en
     MaterialTheme(colorScheme = darkColorScheme(primary = red, background = bg, surface = Color(0xFF1D1E25))) {
-        Column(Modifier.fillMaxSize().background(bg)) {
+        if (playerFullscreen && safePlayerUrl != null && selected != null) {
+            Box(Modifier.fillMaxSize().background(Color.Black)) {
+                SafeEmbeddedPlayer(
+                    embedUrl = safePlayerUrl!!,
+                    referer = resumeUrl ?: selected!!.url,
+                    modifier = Modifier.fillMaxSize()
+                )
+                TextButton(
+                    modifier = Modifier.align(Alignment.TopEnd).tvFocus().padding(12.dp),
+                    onClick = { playerFullscreen = false }
+                ) { Text(label("Exit full screen", "خروج از تمام‌صفحه"), color = Color.White) }
+            }
+        } else Column(Modifier.fillMaxSize().background(bg)) {
             Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween) {
-                Text("PersianRubinFilm v0.10.2", color = red, fontWeight = FontWeight.Bold, fontSize = if (isTv) 29.sp else 22.sp)
+                Text("PersianRubinFilm v0.10.3", color = red, fontWeight = FontWeight.Bold, fontSize = if (isTv) 29.sp else 22.sp)
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     if (selected == null) {
                         if (searchOpen) {
@@ -665,6 +733,8 @@ private fun App() {
             }
             if (selected != null) {
                 val film = selected!!
+                // Remote D-pad navigation scrolls the entire detail page, including episode selection.
+                Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
                 TextButton(modifier = Modifier.tvFocus(), onClick = { selected = null; resumeUrl = null }) { Text(label("← Back", "بازگشت ←")) }
                 Text(film.title, Modifier.padding(horizontal = 16.dp, vertical = 8.dp), color = Color.White, fontSize = 22.sp)
                 Text(label("Play opens the video provider directly, without loading the advertising-filled website. The video host may still require one tap to start.",
@@ -709,6 +779,7 @@ private fun App() {
                                 writeHistory(prefs, history)
                             }
                             playRequested = true
+                            playerFullscreen = isTv
                             playbackAttempt++
                         }) {
                         Text(label("▶ Play", "▶ پخش"))
@@ -716,10 +787,16 @@ private fun App() {
                     TextButton(modifier = Modifier.tvFocus(), onClick = {
                         (context as? MainActivity)?.toggleCursor()
                     }) { Text(label("Mouse: toggle (MENU)", "ماوس: تغییر حالت")) }
+                    if (safePlayerUrl != null) {
+                        TextButton(modifier = Modifier.tvFocus(), onClick = {
+                            (context as? MainActivity)?.attachCursor(null)
+                            playerFullscreen = true
+                        }) { Text(label("⛶ Full screen", "⛶ تمام صفحه")) }
+                    }
                 }
                 val lastPage = history[film.url]?.lastPage
                 if (lastPage != null && lastPage != film.url) {
-                    TextButton(onClick = { resumeUrl = lastPage; playRequested = true; playbackAttempt++ }) {
+                    TextButton(onClick = { resumeUrl = lastPage; playRequested = true; playerFullscreen = isTv; playbackAttempt++ }) {
                         Text(label("Open last visited episode/page", "باز کردن آخرین قسمت / صفحه"))
                     }
                 }
@@ -749,53 +826,13 @@ private fun App() {
                     }
                 } else if (safePlayerUrl != null) key(film.url, safePlayerUrl, playbackAttempt) {
                     val embedUrl = safePlayerUrl!!
-                    AndroidView(factory = { ctx ->
-                        TvCursorFrame(ctx).apply {
-                          (context as? MainActivity)?.attachCursor(this)
-                          browser.apply {
-                            settings.javaScriptEnabled = true
-                            settings.domStorageEnabled = true
-                            settings.loadsImagesAutomatically = true
-                            settings.javaScriptCanOpenWindowsAutomatically = false
-                            isFocusable = true
-                            isFocusableInTouchMode = true
-                            settings.setSupportMultipleWindows(false)
-                            settings.mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
-                            // Allows Play to start the embedded video without a second Android WebView gesture.
-                            settings.mediaPlaybackRequiresUserGesture = false
-                            CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
-                            webChromeClient = object : WebChromeClient() {
-                                override fun onCreateWindow(view: WebView?, isDialog: Boolean,
-                                    isUserGesture: Boolean, resultMsg: Message?): Boolean = false
-                            }
-                            webViewClient = object : WebViewClient() {
-                                override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
-                                    val url = request?.url ?: return null
-                                    if (isAdHost(url.host)) {
-                                        return WebResourceResponse("text/plain", "UTF-8", ByteArrayInputStream(ByteArray(0)))
-                                    }
-                                    return null
-                                }
-                                override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
-                                    val requestUri = request?.url ?: return true
-                                    if (!request.isForMainFrame) return false // CDN/subframes needed for video.
-                                    return !isAllowedPlayerNavigation(requestUri, embedUrl)
-                                }
-                                override fun onPageFinished(view: WebView?, url: String?) {
-                                    super.onPageFinished(view, url)
-                                    // The host player is loaded directly; do not inject the source-site DOM/ad scripts.
-                                    view?.evaluateJavascript("""(function(){
-                                        var v=document.querySelector('video');
-                                        if(v){v.autoplay=true;var p=v.play();if(p&&p.catch)p.catch(function(){});}
-                                    })();""", null)
-                                }
-                            }
-                            loadUrl(embedUrl, mapOf("Referer" to (resumeUrl ?: film.url)))
-                          }
-                        }
-                    }, modifier = Modifier.fillMaxWidth().weight(1f),
-                    update = { (context as? MainActivity)?.attachCursor(it) })
+                    SafeEmbeddedPlayer(
+                        embedUrl = embedUrl,
+                        referer = resumeUrl ?: film.url,
+                        modifier = Modifier.fillMaxWidth().height(if (isTv) 450.dp else 310.dp)
+                    )
                 }
+                } // Scrollable detail area
             } else {
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
                     listOf("home" to label("Home", "خانه"), "history" to label("History", "تاریخچه"), "movie" to label("Movies", "فیلم‌ها"),
