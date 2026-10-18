@@ -288,24 +288,45 @@ internal class TvCursorFrame(context: android.content.Context) : FrameLayout(con
     }
 }
 
-// Extract only episode links present on the series detail page; never manufacture episodes.
+// Only accept links with an unambiguous season AND episode designation.
+// Do not infer a season from arbitrary URL numbers, generic navigation, or episode-only links.
 private suspend fun fetchEpisodes(film: Film): List<Episode> = withContext(Dispatchers.IO) {
     if (film.type != "series") return@withContext emptyList()
     try {
         val doc = Jsoup.connect(film.url).userAgent("Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36")
             .referrer(HOME).timeout(14000).get()
         val found = linkedMapOf<String, Episode>()
-        val seasonPattern = Regex("""(?:season|فصل|s)[\s._:-]*(\d{1,2})""", RegexOption.IGNORE_CASE)
-        val episodePattern = Regex("""(?:episode|ep|قسمت|e)[\s._:#-]*(\d{1,3})""", RegexOption.IGNORE_CASE)
+        // Require both numbers to appear together, in order, in the link title or URL slug.
+        // Avoid single-letter s/e regexes, which matched unrelated URL fragments (e.g. s16).
+        val seasonThenEpisode = Regex(
+            """(?:season|فصل)[\s._:/\-]*(\d{1,2})[\s._:/\-]*(?:episode|ep\.?|قسمت)[\s._:/\-]*(\d{1,3})""",
+            RegexOption.IGNORE_CASE
+        )
+        val episodeThenSeason = Regex(
+            """(?:episode|ep\.?|قسمت)[\s._:/\-]*(\d{1,3})[\s._:/\-]*(?:season|فصل)[\s._:/\-]*(\d{1,2})""",
+            RegexOption.IGNORE_CASE
+        )
+        val compact = Regex("""(?<![a-z0-9])s(\d{1,2})[._\- ]*e(\d{1,3})(?![a-z0-9])""", RegexOption.IGNORE_CASE)
+        val siteHost = URI(BASE).host
         for (a in doc.select("a[href]")) {
             val url = a.absUrl("href")
-            val label = (a.text() + " " + a.attr("title") + " " + url.substringAfterLast('/'))
-            val episodeNumber = episodePattern.find(label)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: continue
-            val host = try { URI(url).host.orEmpty() } catch (_: Exception) { "" }
-            if (!host.equals(URI(BASE).host, true) || !url.startsWith("https://")) continue
-            val seasonNumber = seasonPattern.find(label)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 1
-            val title = a.text().trim().takeIf { it.length in 3..90 } ?: "Episode $episodeNumber"
-            found[url] = Episode(seasonNumber, episodeNumber, title, url)
+            val uri = try { URI(url) } catch (_: Exception) { continue }
+            if (uri.scheme != "https" || !uri.host.equals(siteHost, true)) continue
+            if (uri.path.isNullOrBlank() || uri.path == URI(film.url).path) continue
+            val visible = listOf(a.text(), a.attr("title"), a.attr("aria-label"))
+                .filter { it.isNotBlank() }.joinToString(" ").trim()
+            val slug = uri.path.substringAfterLast('/').substringBeforeLast('.').replace('-', ' ').replace('_', ' ')
+            // Prefer the explicit visible label. A slug is only used if it contains BOTH labels.
+            val matchText = listOf(visible, slug).firstNotNullOfOrNull { label ->
+                seasonThenEpisode.find(label)?.let { it.groupValues[1].toIntOrNull() to it.groupValues[2].toIntOrNull() }
+                    ?: episodeThenSeason.find(label)?.let { it.groupValues[2].toIntOrNull() to it.groupValues[1].toIntOrNull() }
+                    ?: compact.find(label)?.let { it.groupValues[1].toIntOrNull() to it.groupValues[2].toIntOrNull() }
+            } ?: continue
+            val (season, number) = matchText
+            if (season == null || number == null || season !in 1..30 || number !in 1..200) continue
+            // Keep only one entry per real season/episode combination.
+            val key = "$season:$number"
+            found.putIfAbsent(key, Episode(season, number, "Season $season Episode $number", url))
         }
         found.values.sortedWith(compareBy<Episode> { it.season }.thenBy { it.number })
     } catch (_: Exception) { emptyList() }
@@ -588,7 +609,7 @@ private fun App() {
         Column(Modifier.fillMaxSize().background(bg)) {
             Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween) {
-                Text("PersianRubinFilm v0.10", color = red, fontWeight = FontWeight.Bold, fontSize = if (isTv) 29.sp else 22.sp)
+                Text("PersianRubinFilm v0.10.1", color = red, fontWeight = FontWeight.Bold, fontSize = if (isTv) 29.sp else 22.sp)
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     if (selected == null) {
                         if (searchOpen) {
