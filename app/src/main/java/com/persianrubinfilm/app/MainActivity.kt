@@ -48,6 +48,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import kotlinx.coroutines.launch
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -280,6 +281,16 @@ internal class TvCursorFrame(context: android.content.Context) : FrameLayout(con
         cursorY = cursorY.coerceIn(0f, (height-1).coerceAtLeast(0).toFloat())
         dot.invalidate()
         return true
+    }
+    fun toggleVideoPlayback() {
+        // This works for HTML5 videos in the player document. Cross-origin iframe
+        // controls still require mouse mode and the provider's own control bar.
+        browser.evaluateJavascript("""(function(){
+            var v=document.querySelector('video');
+            if(!v)return 'external-player';
+            if(v.paused){var p=v.play();if(p&&p.catch)p.catch(function(){});}else{v.pause();}
+            return 'ok';
+        })();""", null)
     }
     fun click(): Boolean {
         if (!enabled) return false
@@ -540,6 +551,9 @@ private suspend fun fetchCatalog(): List<Film> = withContext(Dispatchers.IO) {
 class MainActivity : ComponentActivity() {
     private var tvCursor: TvCursorFrame? = null
     private var mouseEnabled = false
+    private var detailScroll: ((Int) -> Unit)? = null
+    internal fun setDetailScroll(handler: ((Int) -> Unit)?) { detailScroll = handler }
+    internal fun toggleVideoPlayback() { tvCursor?.toggleVideoPlayback() }
     internal fun attachCursor(frame: TvCursorFrame?) {
         tvCursor = frame
         tvCursor?.mouseMode(mouseEnabled)
@@ -554,9 +568,23 @@ class MainActivity : ComponentActivity() {
             if (event.keyCode == KeyEvent.KEYCODE_MENU && event.action == KeyEvent.ACTION_UP) {
                 toggleCursor(); return true
             }
-            // Long-press Play/Pause toggles cursor; regular Play/Pause is left to the player.
-            if (event.keyCode == KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE && event.isLongPress) {
-                toggleCursor(); return true
+            // Media Play/Pause pauses HTML5 video where the host exposes it.
+            // Long-press remains the alternative mouse-mode shortcut.
+            if (event.keyCode == KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE ||
+                event.keyCode == KeyEvent.KEYCODE_MEDIA_PLAY ||
+                event.keyCode == KeyEvent.KEYCODE_MEDIA_PAUSE) {
+                if (event.isLongPress) { toggleCursor(); return true }
+                if (event.action == KeyEvent.ACTION_UP) toggleVideoPlayback()
+                return true
+            }
+            // When the embedded player owns focus, D-pad no longer reaches Compose.
+            // Hand vertical keys to the detail scroll state in regular navigation mode.
+            if (!mouseEnabled && tvCursor?.browser?.hasFocus() == true &&
+                (event.keyCode == KeyEvent.KEYCODE_DPAD_UP ||
+                 event.keyCode == KeyEvent.KEYCODE_DPAD_DOWN) && detailScroll != null) {
+                if (event.action == KeyEvent.ACTION_DOWN) detailScroll?.invoke(
+                    if (event.keyCode == KeyEvent.KEYCODE_DPAD_DOWN) 1 else -1)
+                return true
             }
             if (mouseEnabled) {
                 if (event.keyCode == KeyEvent.KEYCODE_BACK && event.action == KeyEvent.ACTION_UP) {
@@ -644,7 +672,10 @@ private fun App() {
     var selected by remember { mutableStateOf<Film?>(null) }
     var resumeUrl by remember { mutableStateOf<String?>(null) }
     var playerFullscreen by remember { mutableStateOf(false) }
-    BackHandler(playerFullscreen) { playerFullscreen = false }
+    BackHandler(playerFullscreen) {
+        (context as? MainActivity)?.attachCursor(null)
+        playerFullscreen = false
+    }
     BackHandler(selected != null && !playerFullscreen) {
         (context as? MainActivity)?.attachCursor(null)
         selected = null; resumeUrl = null; playerFullscreen = false
@@ -705,15 +736,27 @@ private fun App() {
                     referer = resumeUrl ?: selected!!.url,
                     modifier = Modifier.fillMaxSize()
                 )
-                TextButton(
-                    modifier = Modifier.align(Alignment.TopEnd).tvFocus().padding(12.dp),
-                    onClick = { playerFullscreen = false }
-                ) { Text(label("Exit full screen", "خروج از تمام‌صفحه"), color = Color.White) }
+                // These controls are focusable from the Fire TV remote even when the
+                // third-party player's native controls don't respond to D-pad keys.
+                Row(Modifier.align(Alignment.TopEnd).padding(8.dp)
+                    .background(Color(0xCC101116), RoundedCornerShape(10.dp)),
+                    verticalAlignment = Alignment.CenterVertically) {
+                    TextButton(modifier = Modifier.tvFocus(), onClick = {
+                        (context as? MainActivity)?.toggleVideoPlayback()
+                    }) { Text("⏯ Play/Pause", color = Color.White) }
+                    TextButton(modifier = Modifier.tvFocus(), onClick = {
+                        (context as? MainActivity)?.toggleCursor()
+                    }) { Text("Mouse (MENU)", color = Color.White) }
+                    TextButton(modifier = Modifier.tvFocus(), onClick = {
+                        (context as? MainActivity)?.attachCursor(null)
+                        playerFullscreen = false
+                    }) { Text(label("Exit full screen", "خروج از تمام‌صفحه"), color = Color.White) }
+                }
             }
         } else Column(Modifier.fillMaxSize().background(bg)) {
             Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween) {
-                Text("PersianRubinFilm v0.10.3", color = red, fontWeight = FontWeight.Bold, fontSize = if (isTv) 29.sp else 22.sp)
+                Text("PersianRubinFilm v0.10.4", color = red, fontWeight = FontWeight.Bold, fontSize = if (isTv) 29.sp else 22.sp)
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     if (selected == null) {
                         if (searchOpen) {
@@ -733,8 +776,20 @@ private fun App() {
             }
             if (selected != null) {
                 val film = selected!!
-                // Remote D-pad navigation scrolls the entire detail page, including episode selection.
-                Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
+                // Scrolling must remain available when the nested Android WebView owns
+                // focus; its D-pad events otherwise never reach this Compose Column.
+                val detailScrollState = rememberScrollState()
+                val detailScrollScope = rememberCoroutineScope()
+                DisposableEffect(film.url, playerFullscreen) {
+                    (context as? MainActivity)?.setDetailScroll { direction ->
+                        detailScrollScope.launch {
+                            detailScrollState.animateScrollTo(
+                                (detailScrollState.value + direction * 320).coerceIn(0, detailScrollState.maxValue))
+                        }
+                    }
+                    onDispose { (context as? MainActivity)?.setDetailScroll(null) }
+                }
+                Column(Modifier.fillMaxSize().verticalScroll(detailScrollState)) {
                 TextButton(modifier = Modifier.tvFocus(), onClick = { selected = null; resumeUrl = null }) { Text(label("← Back", "بازگشت ←")) }
                 Text(film.title, Modifier.padding(horizontal = 16.dp, vertical = 8.dp), color = Color.White, fontSize = 22.sp)
                 Text(label("Play opens the video provider directly, without loading the advertising-filled website. The video host may still require one tap to start.",
@@ -831,6 +886,19 @@ private fun App() {
                         referer = resumeUrl ?: film.url,
                         modifier = Modifier.fillMaxWidth().height(if (isTv) 450.dp else 310.dp)
                     )
+                }
+                if (isTv) {
+                    Row(Modifier.fillMaxWidth().padding(12.dp), horizontalArrangement = Arrangement.SpaceBetween) {
+                        TextButton(modifier = Modifier.tvFocus(), onClick = {
+                            detailScrollScope.launch { detailScrollState.animateScrollTo(0) }
+                        }) { Text("↑ Top") }
+                        TextButton(modifier = Modifier.tvFocus(), onClick = {
+                            detailScrollScope.launch { detailScrollState.animateScrollTo(detailScrollState.maxValue) }
+                        }) { Text("↓ Video / Bottom") }
+                        TextButton(modifier = Modifier.tvFocus(), onClick = {
+                            (context as? MainActivity)?.toggleVideoPlayback()
+                        }) { Text("⏯ Play/Pause") }
+                    }
                 }
                 } // Scrollable detail area
             } else {
