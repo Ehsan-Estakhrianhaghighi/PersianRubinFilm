@@ -1,6 +1,16 @@
 package com.persianrubinfilm.app
 
 import android.os.Bundle
+import android.view.KeyEvent
+import android.view.MotionEvent
+import android.view.View
+import android.graphics.Canvas
+import android.graphics.Paint
+import android.widget.FrameLayout
+import android.webkit.WebView.HitTestResult
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.activity.compose.BackHandler
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.draw.drawWithContent
@@ -59,6 +69,7 @@ private const val HOME = "$BASE/safeasli"
 private val red = Color(0xFFE63946)
 private val bg = Color(0xFF101116)
 private data class Film(val title: String, val url: String, val poster: String?, val type: String)
+private data class Episode(val season: Int, val number: Int, val title: String, val url: String)
 private data class WatchEntry(val url: String, val title: String, val poster: String?, val type: String,
     val lastPage: String, val visitedAt: Long, val completed: Boolean = false)
 
@@ -180,7 +191,8 @@ private fun suppressPageOverlays(view: WebView) {
         '[class*="adsbygoogle" i],[id*="floating-ad" i],[class*="floating-ad" i],'+
         '.adsbygoogle,ins.adsbygoogle,[data-ad-client],[data-ad-slot],'+
         '[class*="adsterra" i],[id*="adsterra" i],[class*="monetag" i],'+
-        '[class*="popads" i],[id*="popads" i] {display:none!important}';
+        '[class*="popads" i],[id*="popads" i],'+
+        'iframe[src*="doubleclick"],iframe[src*="adsterra"],iframe[src*="monetag"] {display:none!important}';
       (document.head||document.documentElement).appendChild(css);
       function clean(){
         document.querySelectorAll('aside,div,section,dialog').forEach(function(el){
@@ -190,7 +202,8 @@ private fun suppressPageOverlays(view: WebView) {
           // Only hide recognisable scam/finance ad overlays, not video player UI.
           if((txt.includes('congratulations')&&
               (txt.includes('transfer money')||txt.includes('withdraw money')||txt.includes('$35,000')))||
-             (txt.includes('withdraw money')&&txt.includes('transfer money'))){
+             (txt.includes('withdraw money')&&txt.includes('transfer money'))||
+             (txt.includes('whatsapp')&&txt.includes('hacked')&&txt.includes('learn more'))){
             let box=el;
             for(let i=0;i<3&&box.parentElement;i++){
               const p=box.parentElement;
@@ -217,6 +230,85 @@ private fun suppressPageOverlays(view: WebView) {
       },true);
       document.querySelectorAll('a[target="_blank"]').forEach(a=>a.removeAttribute('target'));
     })();""", null)
+}
+
+// A cursor layered over a real WebView. D-pad moves it; OK dispatches a real touch.
+internal class TvCursorFrame(context: android.content.Context) : FrameLayout(context) {
+    val browser = WebView(context)
+    private var cursorX = 0f
+    private var cursorY = 0f
+    private var enabled = false
+    private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = android.graphics.Color.RED
+        style = Paint.Style.STROKE
+        strokeWidth = 4f * resources.displayMetrics.density
+    }
+    private val dot = object : View(context) {
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            if (!enabled) return
+            canvas.drawCircle(cursorX, cursorY, 11f * resources.displayMetrics.density, paint)
+            canvas.drawLine(cursorX - 18f, cursorY, cursorX + 18f, cursorY, paint)
+            canvas.drawLine(cursorX, cursorY - 18f, cursorX, cursorY + 18f, paint)
+        }
+    }
+    init {
+        addView(browser, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
+        addView(dot, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
+        dot.isClickable = false
+        dot.isFocusable = false
+    }
+    fun mouseMode(value: Boolean) {
+        enabled = value
+        if (cursorX == 0f) cursorX = width / 2f
+        if (cursorY == 0f) cursorY = height / 2f
+        dot.invalidate()
+    }
+    fun move(direction: Int): Boolean {
+        if (!enabled) return false
+        val step = 32f * resources.displayMetrics.density
+        when (direction) {
+            KeyEvent.KEYCODE_DPAD_LEFT -> cursorX -= step
+            KeyEvent.KEYCODE_DPAD_RIGHT -> cursorX += step
+            KeyEvent.KEYCODE_DPAD_UP -> cursorY -= step
+            KeyEvent.KEYCODE_DPAD_DOWN -> cursorY += step
+            else -> return false
+        }
+        cursorX = cursorX.coerceIn(0f, (width-1).coerceAtLeast(0).toFloat())
+        cursorY = cursorY.coerceIn(0f, (height-1).coerceAtLeast(0).toFloat())
+        dot.invalidate()
+        return true
+    }
+    fun click(): Boolean {
+        if (!enabled) return false
+        val now = android.os.SystemClock.uptimeMillis()
+        browser.dispatchTouchEvent(MotionEvent.obtain(now,now,MotionEvent.ACTION_DOWN,cursorX,cursorY,0))
+        browser.dispatchTouchEvent(MotionEvent.obtain(now,now+80,MotionEvent.ACTION_UP,cursorX,cursorY,0))
+        return true
+    }
+}
+
+// Extract only episode links present on the series detail page; never manufacture episodes.
+private suspend fun fetchEpisodes(film: Film): List<Episode> = withContext(Dispatchers.IO) {
+    if (film.type != "series") return@withContext emptyList()
+    try {
+        val doc = Jsoup.connect(film.url).userAgent("Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36")
+            .referrer(HOME).timeout(14000).get()
+        val found = linkedMapOf<String, Episode>()
+        val seasonPattern = Regex("""(?:season|فصل|s)[\s._:-]*(\d{1,2})""", RegexOption.IGNORE_CASE)
+        val episodePattern = Regex("""(?:episode|ep|قسمت|e)[\s._:#-]*(\d{1,3})""", RegexOption.IGNORE_CASE)
+        for (a in doc.select("a[href]")) {
+            val url = a.absUrl("href")
+            val label = (a.text() + " " + a.attr("title") + " " + url.substringAfterLast('/'))
+            val episodeNumber = episodePattern.find(label)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: continue
+            val host = try { URI(url).host.orEmpty() } catch (_: Exception) { "" }
+            if (!host.equals(URI(BASE).host, true) || !url.startsWith("https://")) continue
+            val seasonNumber = seasonPattern.find(label)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 1
+            val title = a.text().trim().takeIf { it.length in 3..90 } ?: "Episode $episodeNumber"
+            found[url] = Episode(seasonNumber, episodeNumber, title, url)
+        }
+        found.values.sortedWith(compareBy<Episode> { it.season }.thenBy { it.number })
+    } catch (_: Exception) { emptyList() }
 }
 
 private fun isAllowedNavigation(target: Uri, originalHost: String): Boolean {
@@ -328,6 +420,43 @@ private suspend fun fetchCatalog(): List<Film> = withContext(Dispatchers.IO) {
 }
 
 class MainActivity : ComponentActivity() {
+    private var tvCursor: TvCursorFrame? = null
+    private var mouseEnabled = false
+    internal fun attachCursor(frame: TvCursorFrame?) {
+        tvCursor = frame
+        tvCursor?.mouseMode(mouseEnabled)
+    }
+    internal fun toggleCursor() {
+        mouseEnabled = !mouseEnabled
+        tvCursor?.mouseMode(mouseEnabled)
+    }
+    internal fun mouseModeEnabled() = mouseEnabled
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (tvCursor != null) {
+            if (event.keyCode == KeyEvent.KEYCODE_MENU && event.action == KeyEvent.ACTION_UP) {
+                toggleCursor(); return true
+            }
+            // Long-press Play/Pause toggles cursor; regular Play/Pause is left to the player.
+            if (event.keyCode == KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE && event.isLongPress) {
+                toggleCursor(); return true
+            }
+            if (mouseEnabled) {
+                if (event.keyCode == KeyEvent.KEYCODE_BACK && event.action == KeyEvent.ACTION_UP) {
+                    toggleCursor(); return true
+                }
+                if (event.keyCode in listOf(KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_DOWN,
+                    KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_DPAD_RIGHT)) {
+                    if (event.action == KeyEvent.ACTION_DOWN) tvCursor?.move(event.keyCode)
+                    return true
+                }
+                if (event.keyCode == KeyEvent.KEYCODE_DPAD_CENTER || event.keyCode == KeyEvent.KEYCODE_ENTER) {
+                    if (event.action == KeyEvent.ACTION_UP) tvCursor?.click()
+                    return true
+                }
+            }
+        }
+        return super.dispatchKeyEvent(event)
+    }
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent { App() }
@@ -345,7 +474,26 @@ private fun App() {
     var query by remember { mutableStateOf("") }
     var selected by remember { mutableStateOf<Film?>(null) }
     var resumeUrl by remember { mutableStateOf<String?>(null) }
-    BackHandler(selected != null) { selected = null; resumeUrl = null }
+    BackHandler(selected != null) {
+        (context as? MainActivity)?.attachCursor(null)
+        selected = null; resumeUrl = null
+    }
+    var searchOpen by remember { mutableStateOf(false) }
+    var episodes by remember { mutableStateOf<List<Episode>>(emptyList()) }
+    var chosenSeason by remember { mutableIntStateOf(1) }
+    var chosenEpisode by remember { mutableStateOf<Episode?>(null) }
+    var episodeLoading by remember { mutableStateOf(false) }
+    var playRequested by remember { mutableStateOf(false) }
+    LaunchedEffect(selected?.url) {
+        val film = selected
+        episodes = emptyList(); chosenEpisode = null; chosenSeason = 1; playRequested = false
+        if (film?.type == "series") {
+            episodeLoading = true
+            episodes = fetchEpisodes(film)
+            chosenSeason = episodes.firstOrNull()?.season ?: 1
+            episodeLoading = false
+        }
+    }
     var catalog by remember { mutableStateOf<List<Film>>(emptyList()) }
     var loading by remember { mutableStateOf(true) }
     var history by remember { mutableStateOf(readHistory(prefs)) }
@@ -364,9 +512,22 @@ private fun App() {
         Column(Modifier.fillMaxSize().background(bg)) {
             Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween) {
-                Text("PersianRubinFilm v0.8", color = red, fontWeight = FontWeight.Bold, fontSize = if (isTv) 29.sp else 22.sp)
-                TextButton(modifier = Modifier.tvFocus(), onClick = { persian = !persian; prefs.edit().putBoolean("persian", persian).apply() }) {
-                    Text(if (persian) "English" else "فارسی")
+                Text("PersianRubinFilm v0.9", color = red, fontWeight = FontWeight.Bold, fontSize = if (isTv) 29.sp else 22.sp)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    if (selected == null) {
+                        if (searchOpen) {
+                            OutlinedTextField(query, { query = it },
+                                modifier = Modifier.width(if (isTv) 280.dp else 145.dp).tvFocus(),
+                                placeholder = { Text(label("Search", "جستجو")) }, singleLine = true)
+                        }
+                        TextButton(modifier = Modifier.tvFocus(), onClick = {
+                            searchOpen = !searchOpen
+                            if (!searchOpen) query = ""
+                        }) { Text(if (searchOpen) "✕" else "⌕ " + label("Search", "جستجو")) }
+                    }
+                    TextButton(modifier = Modifier.tvFocus(), onClick = {
+                        persian = !persian; prefs.edit().putBoolean("persian", persian).apply()
+                    }) { Text(if (persian) "English" else "فارسی") }
                 }
             }
             if (selected != null) {
@@ -375,6 +536,42 @@ private fun App() {
                 Text(film.title, Modifier.padding(horizontal = 16.dp, vertical = 8.dp), color = Color.White, fontSize = 22.sp)
                 Text(label("Playback uses the source site's own page/player. Availability and permissions depend on the provider.",
                     "پخش از صفحه و پخش‌کنندهٔ سایت اصلی انجام می‌شود."), Modifier.padding(16.dp), color = Color.LightGray)
+                if (film.type == "series") {
+                    if (episodeLoading) CircularProgressIndicator(Modifier.padding(12.dp))
+                    else if (episodes.isEmpty()) {
+                        Text(label("No episode links detected. Open the source series page below to select an episode.",
+                            "فهرست قسمت‌ها پیدا نشد؛ قسمت را در صفحه اصلی انتخاب کنید."),
+                            Modifier.padding(horizontal = 16.dp), color = Color.LightGray)
+                    } else {
+                        Text(label("Choose season", "انتخاب فصل"), Modifier.padding(horizontal = 16.dp), color = Color.White)
+                        LazyRow(Modifier.fillMaxWidth(), contentPadding = PaddingValues(horizontal = 12.dp)) {
+                            items(episodes.map { it.season }.distinct()) { season ->
+                                TextButton(modifier = Modifier.tvFocus(), onClick = { chosenSeason = season; chosenEpisode = null }) {
+                                    Text(label("Season $season", "فصل $season"),
+                                        color = if (chosenSeason == season) red else Color.White)
+                                }
+                            }
+                        }
+                        LazyRow(Modifier.fillMaxWidth(), contentPadding = PaddingValues(horizontal = 12.dp)) {
+                            items(episodes.filter { it.season == chosenSeason }) { episode ->
+                                TextButton(modifier = Modifier.tvFocus(), onClick = { chosenEpisode = episode }) {
+                                    Text(label("Episode ${episode.number}", "قسمت ${episode.number}"),
+                                        color = if (chosenEpisode?.url == episode.url) red else Color.White)
+                                }
+                            }
+                        }
+                    }
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Button(modifier = Modifier.padding(start = 16.dp).tvFocus(),
+                        enabled = film.type != "series" || episodes.isEmpty() || chosenEpisode != null,
+                        onClick = { resumeUrl = chosenEpisode?.url ?: film.url; playRequested = true }) {
+                        Text(label("▶ Play", "▶ پخش"))
+                    }
+                    TextButton(modifier = Modifier.tvFocus(), onClick = {
+                        (context as? MainActivity)?.toggleCursor()
+                    }) { Text(label("Mouse: toggle (MENU)", "ماوس: تغییر حالت")) }
+                }
                 val lastPage = history[film.url]?.lastPage
                 if (lastPage != null && lastPage != film.url) {
                     TextButton(onClick = { resumeUrl = lastPage }) {
@@ -386,9 +583,15 @@ private fun App() {
                     if (old != null) { history = history + (film.url to old.copy(completed = !old.completed)); writeHistory(prefs, history) }
                 }) { Text(if (history[film.url]?.completed == true) label("✓ Watched (tap to undo)", "✓ دیده‌شده")
                     else label("Mark watched", "علامت‌گذاری به عنوان دیده‌شده")) }
-                key(film.url, resumeUrl) {
+                if (!playRequested) {
+                    Text(label("Press Play to open this title.", "برای باز کردن پخش، دکمه پخش را بزنید."),
+                        Modifier.padding(16.dp), color = Color.LightGray)
+                }
+                if (playRequested) key(film.url, resumeUrl) {
                     AndroidView(factory = { ctx ->
-                        WebView(ctx).apply {
+                        TvCursorFrame(ctx).apply {
+                          (context as? MainActivity)?.attachCursor(this)
+                          browser.apply {
                             settings.javaScriptEnabled = true
                             settings.domStorageEnabled = true
                             settings.javaScriptCanOpenWindowsAutomatically = false
@@ -428,12 +631,12 @@ private fun App() {
                                 }
                             }
                             loadUrl(resumeUrl ?: film.url)
+                          }
                         }
-                    }, modifier = Modifier.fillMaxSize())
+                    }, modifier = Modifier.fillMaxWidth().weight(1f),
+                    update = { (context as? MainActivity)?.attachCursor(it) })
                 }
             } else {
-                OutlinedTextField(query, { query = it }, label = { Text(label("Search titles", "جستجوی فیلم و سریال")) },
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp).tvFocus(), singleLine = true)
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
                     listOf("home" to label("Home", "خانه"), "history" to label("History", "تاریخچه"), "movie" to label("Movies", "فیلم‌ها"),
                         "series" to label("Series", "سریال‌ها"), "favorites" to label("My List", "فهرست من"))
@@ -483,7 +686,9 @@ private fun App() {
                                 Column(Modifier.fillMaxWidth().tvFocus().clickable { openFilm(film) }.padding(horizontal = 16.dp)) {
                                     Poster(film, Modifier.fillMaxWidth().height(190.dp))
                                     Text(film.title, Modifier.padding(vertical = 8.dp), color = Color.White, fontSize = 20.sp)
-                                    Button(modifier = Modifier.tvFocus(), onClick = { openFilm(film) }) { Text(label("Watch", "تماشا")) }
+                                    Button(modifier = Modifier.tvFocus(), onClick = { openFilm(film) }) {
+                                        Text(label(if (film.type == "series") "Episodes" else "▶ Play", if (film.type == "series") "قسمت‌ها" else "▶ پخش"))
+                                    }
                                 }
                             } }
                             for ((type, en, fa) in listOf(Triple("movie", "Movies", "فیلم‌ها"), Triple("series", "Series", "سریال‌ها"))) {
@@ -531,13 +736,22 @@ private fun App() {
     Column(Modifier.width(if (tv) 212.dp else 145.dp).padding(if (tv) 8.dp else 5.dp)) {
         Poster(film, Modifier.fillMaxWidth().height(if (tv) 275.dp else 195.dp).tvFocus().clickable(onClick = onOpen))
         Text(film.title, Modifier.tvFocus().clickable(onClick = onOpen).padding(top = 5.dp), color = Color.White, fontSize = if (tv) 18.sp else 14.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
-        TextButton(modifier = Modifier.tvFocus(), onClick = onFavorite) { Text(if (saved) "♥" else "+", color = red) }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Button(modifier = Modifier.tvFocus(), contentPadding = PaddingValues(horizontal = 8.dp, vertical = 3.dp),
+                onClick = onOpen) { Text(if (film.type == "series") "Episodes" else "▶ Play", fontSize = 12.sp) }
+            TextButton(modifier = Modifier.tvFocus(), onClick = onFavorite) { Text(if (saved) "♥" else "+", color = red) }
+        }
     }
 }
 @Composable private fun FilmRow(film: Film, saved: Boolean, onOpen: () -> Unit, onFavorite: () -> Unit) {
     Row(Modifier.fillMaxWidth().tvFocus().clickable(onClick = onOpen).padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
         Poster(film, Modifier.size(width = 90.dp, height = 125.dp))
         Text(film.title, Modifier.weight(1f).padding(12.dp), color = Color.White)
-        TextButton(modifier = Modifier.tvFocus(), onClick = onFavorite) { Text(if (saved) "♥" else "+", color = red) }
+        Column {
+            Button(modifier = Modifier.tvFocus(), onClick = onOpen) {
+                Text(if (film.type == "series") "Episodes" else "▶ Play", fontSize = 12.sp)
+            }
+            TextButton(modifier = Modifier.tvFocus(), onClick = onFavorite) { Text(if (saved) "♥" else "+", color = red) }
+        }
     }
 }
