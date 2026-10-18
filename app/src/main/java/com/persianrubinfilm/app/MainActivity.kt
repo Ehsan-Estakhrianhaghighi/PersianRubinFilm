@@ -292,6 +292,50 @@ internal class TvCursorFrame(context: android.content.Context) : FrameLayout(con
             return 'ok';
         })();""", null)
     }
+    // Full-screen TV interaction: OK first toggles an accessible HTML5 video;
+    // for a cross-origin hosted player, it taps the player center instead.
+    // Subsequent D-pad navigation moves a cursor over the provider's real controls.
+    private var playerSelectionStarted = false
+    fun resetRemoteSelection() {
+        playerSelectionStarted = false
+        enabled = false
+        dot.invalidate()
+    }
+    fun playerOk() {
+        if (width <= 0 || height <= 0) return
+        if (!playerSelectionStarted) {
+            playerSelectionStarted = true
+            cursorX = width / 2f
+            cursorY = height / 2f
+            enabled = true
+            dot.invalidate()
+            browser.evaluateJavascript("""(function(){
+                var v=document.querySelector('video');
+                if(!v)return 'external-player';
+                if(v.paused){var p=v.play();if(p&&p.catch)p.catch(function(){});}else{v.pause();}
+                return 'ok';
+            })();""") { result ->
+                if (result != "\"ok\"") click() // third-party iframe: tap to show/toggle its controls
+            }
+        } else {
+            // Selecting the central playback area again means Play/Pause;
+            // selecting a moved cursor position clicks the provider's control.
+            val nearCenter = kotlin.math.abs(cursorX - width / 2f) < 36f * resources.displayMetrics.density &&
+                kotlin.math.abs(cursorY - height / 2f) < 36f * resources.displayMetrics.density
+            if (nearCenter) {
+                browser.evaluateJavascript("""(function(){
+                    var v=document.querySelector('video');
+                    if(!v)return 'external-player';
+                    if(v.paused){var p=v.play();if(p&&p.catch)p.catch(function(){});}else{v.pause();}
+                    return 'ok';
+                })();""") { result -> if (result != "\"ok\"") click() }
+            } else click()
+        }
+    }
+    fun playerDirection(direction: Int): Boolean {
+        if (!playerSelectionStarted) return false
+        return move(direction)
+    }
     fun click(): Boolean {
         if (!enabled) return false
         val now = android.os.SystemClock.uptimeMillis()
@@ -552,11 +596,21 @@ class MainActivity : ComponentActivity() {
     private var tvCursor: TvCursorFrame? = null
     private var mouseEnabled = false
     private var detailScroll: ((Int) -> Unit)? = null
+    private var fullscreenRemote = false
+    internal fun setFullscreenRemote(value: Boolean) {
+        fullscreenRemote = value
+        if (value) {
+            mouseEnabled = false
+            tvCursor?.resetRemoteSelection()
+        } else {
+            tvCursor?.resetRemoteSelection()
+        }
+    }
     internal fun setDetailScroll(handler: ((Int) -> Unit)?) { detailScroll = handler }
     internal fun toggleVideoPlayback() { tvCursor?.toggleVideoPlayback() }
     internal fun attachCursor(frame: TvCursorFrame?) {
         tvCursor = frame
-        tvCursor?.mouseMode(mouseEnabled)
+        if (!fullscreenRemote) tvCursor?.mouseMode(mouseEnabled)
     }
     internal fun toggleCursor() {
         mouseEnabled = !mouseEnabled
@@ -564,6 +618,32 @@ class MainActivity : ComponentActivity() {
     }
     internal fun mouseModeEnabled() = mouseEnabled
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        // The full-screen player captures remote keys before WebView consumes them.
+        // No separate, unreachable Compose control bar is drawn over the video.
+        if (fullscreenRemote && tvCursor != null) {
+            if (event.keyCode == KeyEvent.KEYCODE_DPAD_CENTER ||
+                event.keyCode == KeyEvent.KEYCODE_ENTER ||
+                event.keyCode == KeyEvent.KEYCODE_NUMPAD_ENTER) {
+                if (event.action == KeyEvent.ACTION_UP) tvCursor?.playerOk()
+                return true
+            }
+            if (event.keyCode in listOf(KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_DOWN,
+                KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_DPAD_RIGHT)) {
+                if (event.action == KeyEvent.ACTION_DOWN) tvCursor?.playerDirection(event.keyCode)
+                return true
+            }
+            if (event.keyCode == KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE ||
+                event.keyCode == KeyEvent.KEYCODE_MEDIA_PLAY ||
+                event.keyCode == KeyEvent.KEYCODE_MEDIA_PAUSE) {
+                if (event.action == KeyEvent.ACTION_UP) tvCursor?.playerOk()
+                return true
+            }
+            if (event.keyCode == KeyEvent.KEYCODE_MENU) {
+                // MENU resets selection to video center when the cursor has wandered.
+                if (event.action == KeyEvent.ACTION_UP) tvCursor?.resetRemoteSelection()
+                return true
+            }
+        }
         if (tvCursor != null) {
             if (event.keyCode == KeyEvent.KEYCODE_MENU && event.action == KeyEvent.ACTION_UP) {
                 toggleCursor(); return true
@@ -672,6 +752,10 @@ private fun App() {
     var selected by remember { mutableStateOf<Film?>(null) }
     var resumeUrl by remember { mutableStateOf<String?>(null) }
     var playerFullscreen by remember { mutableStateOf(false) }
+    DisposableEffect(playerFullscreen) {
+        (context as? MainActivity)?.setFullscreenRemote(playerFullscreen)
+        onDispose { (context as? MainActivity)?.setFullscreenRemote(false) }
+    }
     BackHandler(playerFullscreen) {
         (context as? MainActivity)?.attachCursor(null)
         playerFullscreen = false
@@ -730,33 +814,17 @@ private fun App() {
     fun label(en: String, fa: String) = if (persian) fa else en
     MaterialTheme(colorScheme = darkColorScheme(primary = red, background = bg, surface = Color(0xFF1D1E25))) {
         if (playerFullscreen && safePlayerUrl != null && selected != null) {
-            Box(Modifier.fillMaxSize().background(Color.Black)) {
-                SafeEmbeddedPlayer(
-                    embedUrl = safePlayerUrl!!,
-                    referer = resumeUrl ?: selected!!.url,
-                    modifier = Modifier.fillMaxSize()
-                )
-                // These controls are focusable from the Fire TV remote even when the
-                // third-party player's native controls don't respond to D-pad keys.
-                Row(Modifier.align(Alignment.TopEnd).padding(8.dp)
-                    .background(Color(0xCC101116), RoundedCornerShape(10.dp)),
-                    verticalAlignment = Alignment.CenterVertically) {
-                    TextButton(modifier = Modifier.tvFocus(), onClick = {
-                        (context as? MainActivity)?.toggleVideoPlayback()
-                    }) { Text("⏯ Play/Pause", color = Color.White) }
-                    TextButton(modifier = Modifier.tvFocus(), onClick = {
-                        (context as? MainActivity)?.toggleCursor()
-                    }) { Text("Mouse (MENU)", color = Color.White) }
-                    TextButton(modifier = Modifier.tvFocus(), onClick = {
-                        (context as? MainActivity)?.attachCursor(null)
-                        playerFullscreen = false
-                    }) { Text(label("Exit full screen", "خروج از تمام‌صفحه"), color = Color.White) }
-                }
-            }
+            // Native-style remote behavior: fullscreen video only, no overlay buttons.
+            // OK controls the player; arrows reach provider controls via remote pointer.
+            SafeEmbeddedPlayer(
+                embedUrl = safePlayerUrl!!,
+                referer = resumeUrl ?: selected!!.url,
+                modifier = Modifier.fillMaxSize().background(Color.Black)
+            )
         } else Column(Modifier.fillMaxSize().background(bg)) {
             Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween) {
-                Text("PersianRubinFilm v0.10.4", color = red, fontWeight = FontWeight.Bold, fontSize = if (isTv) 29.sp else 22.sp)
+                Text("PersianRubinFilm v0.10.5", color = red, fontWeight = FontWeight.Bold, fontSize = if (isTv) 29.sp else 22.sp)
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     if (selected == null) {
                         if (searchOpen) {
