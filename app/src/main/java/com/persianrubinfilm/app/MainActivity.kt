@@ -8,12 +8,12 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.unit.Dp
 import android.webkit.WebView
+import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.CookieManager
 import android.webkit.URLUtil
 import java.io.ByteArrayInputStream
 import android.webkit.WebViewClient
-import android.webkit.WebResourceRequest
 import android.webkit.WebResourceError
 import android.graphics.Bitmap
 import android.webkit.WebSettings
@@ -23,6 +23,7 @@ import android.content.Intent
 import android.net.Uri
 import org.json.JSONObject
 import coil.request.ImageRequest
+import coil.request.CachePolicy
 import android.webkit.WebChromeClient
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -83,11 +84,13 @@ private fun writeHistory(prefs: android.content.SharedPreferences, entries: Map<
 }
 
 private fun imageUrl(raw: String?, base: String): String? {
-    val value = raw?.trim()?.takeUnless {
+    val value = raw?.trim()?.replace("&amp;", "&")?.takeUnless {
         it.isBlank() || it.startsWith("data:") || it.startsWith("blob:") ||
+            it.startsWith("javascript:") || it.startsWith("//invalid") ||
             it.contains("placeholder", true) || it.contains("no-image", true) ||
             it.contains("loading.gif", true) || it.contains("blank.gif", true) ||
-            it.contains("spacer.gif", true)
+            it.contains("spacer.gif", true) || it.contains("pixel.gif", true) ||
+            it.contains("1x1", true) || it.endsWith(".svg", true)
     } ?: return null
     return try {
         URI(base).resolve(value).toString().takeIf { it.startsWith("https://") || it.startsWith("http://") }
@@ -100,27 +103,55 @@ private fun cssPoster(element: org.jsoup.nodes.Element?, base: String): String? 
     return imageUrl(match?.groupValues?.getOrNull(1), base)
         ?: imageUrl(element.attr("data-bg"), base)
         ?: imageUrl(element.attr("data-background"), base)
+        ?: imageUrl(element.attr("data-bg-src"), base)
 }
 private fun posterFrom(img: org.jsoup.nodes.Element?, base: String): String? {
     if (img == null) return null
-    // Some cards use picture/source or CSS background images instead of img src.
-    for (attr in listOf("data-src", "data-lazy-src", "data-original", "data-image", "data-url", "src")) {
-        imageUrl(img.attr(attr), base)?.let { return it }
+    // Reject site branding and tiny tracking images, not legitimate poster thumbnails.
+    val dimensions = listOf("width", "height").map { img.attr(it).toIntOrNull() }
+    if (dimensions.any { it != null && it in 1..4 }) return null
+    val urls = mutableListOf<String>()
+    // Lazy-loading libraries may put the real poster in a source/srcset or a data-* field.
+    for (attr in listOf("data-src", "data-lazy-src", "data-original", "data-image", "data-url", "data-echo", "data-thumb", "src")) {
+        imageUrl(img.attr(attr), base)?.let(urls::add)
     }
     for (attr in listOf("data-srcset", "srcset")) {
-        val candidates = img.attr(attr).split(",").mapNotNull { chunk ->
-            val parts = chunk.trim().split(Regex("\\s+"))
-            val url = imageUrl(parts.firstOrNull(), base)
-            val size = parts.getOrNull(1)?.removeSuffix("w")?.toIntOrNull() ?: 0
+        val candidates = img.attr(attr).split(",").mapNotNull { part ->
+            val bits = part.trim().split(Regex("""\s+"""))
+            val url = imageUrl(bits.firstOrNull(), base)
+            val size = bits.getOrNull(1)?.removeSuffix("w")?.toIntOrNull() ?: 0
             if (url != null) size to url else null
         }
-        candidates.maxByOrNull { it.first }?.second?.let { return it }
+        candidates.maxByOrNull { it.first }?.second?.let { urls.add(0, it) }
     }
-    return cssPoster(img, base)
+    cssPoster(img, base)?.let { urls.add(0, it) }
+    return urls.firstOrNull { url ->
+        !Regex("""(?:logo|favicon|avatar|icon|spinner|loader|banner|ads?[./_-])""", RegexOption.IGNORE_CASE)
+            .containsMatchIn(URI(url).path.orEmpty())
+    } ?: urls.firstOrNull()
+}
+private fun posterFromDetail(doc: org.jsoup.nodes.Document, title: String): String? {
+    val base = doc.baseUri()
+    for (selector in listOf("meta[property=og:image]", "meta[property=og:image:url]",
+        "meta[name=twitter:image]", "meta[name=twitter:image:src]", "link[rel=image_src]")) {
+        val e = doc.selectFirst(selector) ?: continue
+        imageUrl(e.attr("content").ifBlank { e.attr("href") }, base)?.let { return it }
+    }
+    val imageNodes = doc.select(".mvic-desc img, .mvi-cover img, .poster img, .thumb img, .detail img, .film-poster img, article img, img")
+    val name = title.lowercase().replace(Regex("""[^\p{L}\p{N}]+"""), "")
+    val ranked = imageNodes.mapNotNull { img ->
+        val url = posterFrom(img, base) ?: return@mapNotNull null
+        val alt = (img.attr("alt") + img.attr("title")).lowercase().replace(Regex("""[^\p{L}\p{N}]+"""), "")
+        val score = (if (name.length > 3 && alt.contains(name)) 100 else 0) +
+            (if (img.closest(".poster,.thumb,.mvi-cover,.movie-poster,.film-poster") != null) 30 else 0) +
+            (if ((img.attr("width").toIntOrNull() ?: 0) >= 120) 10 else 0)
+        score to url
+    }
+    return ranked.maxByOrNull { it.first }?.second
 }
 private fun posterModel(context: android.content.Context, film: Film): Any? = film.poster?.let {
     ImageRequest.Builder(context).data(it).crossfade(true)
-        .addHeader("Referer", HOME)
+        .addHeader("Referer", BASE + "/")
         .addHeader("User-Agent", "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120.0 Mobile Safari/537.36")
         .build()
 }
@@ -129,29 +160,60 @@ private val blockedAdHosts = setOf(
     "adnxs.com", "popads.net", "popcash.net", "propellerads.com",
     "onclickads.net", "exoclick.com", "trafficjunky.net",
     "adsterra.com", "ad-maven.com", "hilltopads.net", "clickadu.com",
-    "richads.com", "monetag.com", "popmyads.com", "revenuehits.com"
+    "richads.com", "monetag.com", "popmyads.com", "revenuehits.com",
+    "adclick.g.doubleclick.net", "popunder.net", "adexchangeclear.com",
+    "onclickalgo.com", "pushame.com", "adskeeper.co.uk", "mgid.com",
+    "revcontent.com", "taboola.com", "outbrain.com"
 )
 private fun isAdHost(host: String?): Boolean {
     val h = host?.lowercase() ?: return false
     return blockedAdHosts.any { h == it || h.endsWith(".$it") }
 }
 private fun suppressPageOverlays(view: WebView) {
-    // Only modify the top-level document; do not remove video frames or playback controls.
+    // Keep all iframe/video elements: third-party video hosts are needed for playback.
+    // The MutationObserver removes newly inserted advertising banners/dialogs as well.
     view.evaluateJavascript("""(function(){
-      if(window.__prfGuardInstalled)return; window.__prfGuardInstalled=true;
-      const css=document.createElement('style'); css.textContent=
+      if(window.__prfGuardInstalled)return;window.__prfGuardInstalled=true;
+      const css=document.createElement('style');css.textContent=
         '[id*="popunder" i],[class*="popunder" i],[id*="popup-ad" i],'+
         '[class*="popup-ad" i],[class*="ad-overlay" i],[id*="ad-overlay" i],'+
-        '[class*="adsbygoogle" i] {display:none!important}';
+        '[class*="adsbygoogle" i],[id*="floating-ad" i],[class*="floating-ad" i],'+
+        '.adsbygoogle,ins.adsbygoogle,[data-ad-client],[data-ad-slot],'+
+        '[class*="adsterra" i],[id*="adsterra" i],[class*="monetag" i],'+
+        '[class*="popads" i],[id*="popads" i] {display:none!important}';
       (document.head||document.documentElement).appendChild(css);
-      // Capture unwanted external top-page link clicks, leaving same-site navigation alone.
+      function clean(){
+        document.querySelectorAll('aside,div,section,dialog').forEach(function(el){
+          if(el.closest('video, .jwplayer, .plyr'))return;
+          const txt=(el.innerText||'').trim().toLowerCase();
+          if(txt.length>230||txt.length<12)return;
+          // Only hide recognisable scam/finance ad overlays, not video player UI.
+          if((txt.includes('congratulations')&&
+              (txt.includes('transfer money')||txt.includes('withdraw money')||txt.includes('$35,000')))||
+             (txt.includes('withdraw money')&&txt.includes('transfer money'))){
+            let box=el;
+            for(let i=0;i<3&&box.parentElement;i++){
+              const p=box.parentElement;
+              if((p.innerText||'').trim().length<350 &&
+                 (getComputedStyle(p).position==='fixed'||getComputedStyle(p).position==='absolute')){box=p;break;}
+              break;
+            }
+            box.style.setProperty('display','none','important');
+          }
+        });
+      }
+      clean();let queued=false;
+      const observer=new MutationObserver(function(){if(queued)return;queued=true;
+        requestAnimationFrame(function(){queued=false;clean();});});
+      observer.observe(document.documentElement,{childList:true,subtree:true});
       document.addEventListener('click',function(e){
-        const a=e.target.closest&&e.target.closest('a[href]'); if(!a)return;
-        try {const dest=new URL(a.href,location.href);
+        const a=e.target.closest&&e.target.closest('a[href]');if(!a)return;
+        try{const dest=new URL(a.href,location.href);
           const source=location.hostname.replace(/^www\./,'');
-          if(dest.hostname!==location.hostname && dest.hostname!==source &&
-             !dest.hostname.endsWith('.'+source)) { e.preventDefault();e.stopImmediatePropagation(); }
-        } catch(_){}
+          if(dest.hostname!==location.hostname&&dest.hostname!==source&&
+             !dest.hostname.endsWith('.'+source)){
+             e.preventDefault();e.stopImmediatePropagation();}
+        }catch(_){}
       },true);
       document.querySelectorAll('a[target="_blank"]').forEach(a=>a.removeAttribute('target'));
     })();""", null)
@@ -198,6 +260,7 @@ private suspend fun fetchCatalog(): List<Film> = withContext(Dispatchers.IO) {
                     for (img in link.select("img, source")) {
                         posterFrom(img, base)?.let { return it }
                     }
+                    posterFrom(link.selectFirst("picture source"), base)?.let { return it }
                     cssPoster(link, base)?.let { return it }
                 }
                 for (img in card.select("img, source")) {
@@ -255,9 +318,7 @@ private suspend fun fetchCatalog(): List<Film> = withContext(Dispatchers.IO) {
                     try {
                         val detail = Jsoup.connect(film.url).userAgent(ua)
                             .referrer(HOME).timeout(9000).get()
-                        val meta = detail.selectFirst("meta[property=og:image], meta[name=twitter:image], link[rel=image_src]")
-                        val poster = imageUrl(meta?.attr("content")?.ifBlank { meta.attr("href") }, detail.baseUri())
-                            ?: posterFrom(detail.selectFirst(".poster img, .thumb img, .detail img, article img"), detail.baseUri())
+                        val poster = posterFromDetail(detail, film.title)
                         film.copy(poster = poster)
                     } catch (_: Exception) { film }
                 }
@@ -303,7 +364,7 @@ private fun App() {
         Column(Modifier.fillMaxSize().background(bg)) {
             Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween) {
-                Text("PersianRubinFilm v0.7", color = red, fontWeight = FontWeight.Bold, fontSize = if (isTv) 29.sp else 22.sp)
+                Text("PersianRubinFilm v0.8", color = red, fontWeight = FontWeight.Bold, fontSize = if (isTv) 29.sp else 22.sp)
                 TextButton(modifier = Modifier.tvFocus(), onClick = { persian = !persian; prefs.edit().putBoolean("persian", persian).apply() }) {
                     Text(if (persian) "English" else "فارسی")
                 }
