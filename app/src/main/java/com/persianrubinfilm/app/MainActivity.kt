@@ -311,11 +311,70 @@ private suspend fun fetchEpisodes(film: Film): List<Episode> = withContext(Dispa
     } catch (_: Exception) { emptyList() }
 }
 
-private fun isAllowedNavigation(target: Uri, originalHost: String): Boolean {
-    if (target.scheme != "https") return false
-    val host = target.host?.lowercase() ?: return false
-    // Allow the source site and embedded video-player hosts, but block unsolicited top-level ad redirects.
-    return host == originalHost || host.endsWith(".$originalHost")
+// The catalog/detail pages contain advertising and sometimes scam overlays.
+// Open ONLY an identified, HTTPS video embed in the player WebView instead.
+// Allowlisted provider paths are intentionally narrow; never accept an arbitrary iframe.
+private fun isSupportedVideoEmbed(rawUrl: String): Boolean = try {
+    val uri = URI(rawUrl)
+    if (uri.scheme != "https" || uri.userInfo != null) false
+    else {
+        val host = uri.host?.lowercase()?.removePrefix("www.").orEmpty()
+        val path = uri.path.orEmpty()
+        when (host) {
+            "ok.ru", "m.ok.ru" -> path.matches(Regex("/videoembed/[0-9]+/?"))
+            "vk.com", "vkvideo.ru" -> path == "/video_ext.php"
+            "youtube.com", "youtube-nocookie.com" -> path.startsWith("/embed/")
+            "player.vimeo.com" -> path.startsWith("/video/")
+            "rutube.ru" -> path.startsWith("/play/embed/")
+            "www.aparat.com", "aparat.com" -> path.startsWith("/video/video/embed/")
+            "dailymotion.com" -> path.startsWith("/embed/video/")
+            else -> false
+        }
+    }
+} catch (_: Exception) { false }
+
+private fun autoplayEmbedUrl(rawUrl: String): String = try {
+    val uri = URI(rawUrl)
+    val query = uri.rawQuery.orEmpty()
+    // Pass a standard autoplay hint to the provider; some providers still require a tap.
+    if (Regex("(?:^|&)autoplay=", RegexOption.IGNORE_CASE).containsMatchIn(query)) rawUrl
+    else URI(uri.scheme, uri.rawAuthority, uri.rawPath,
+        (if (query.isEmpty()) "" else "$query&") + "autoplay=1", uri.rawFragment).toASCIIString()
+} catch (_: Exception) { rawUrl }
+
+private suspend fun findSafeVideoEmbed(sourcePage: String): String? = withContext(Dispatchers.IO) {
+    // Never allow this extraction request to fetch an advertising host or arbitrary URL.
+    val origin = URI(BASE)
+    val source = try { URI(sourcePage) } catch (_: Exception) { return@withContext null }
+    if (source.scheme != "https" || !source.host.equals(origin.host, true) ||
+        !source.path.orEmpty().startsWith("/watch/")) return@withContext null
+    try {
+        val doc = Jsoup.connect(sourcePage)
+            .userAgent("Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120.0 Mobile Safari/537.36")
+            .referrer(HOME).timeout(15000).get()
+        val page = doc.baseUri()
+        for (frame in doc.select("iframe[src], iframe[data-src], iframe[data-lazy-src], iframe[data-url]")) {
+            for (attr in listOf("src", "data-src", "data-lazy-src", "data-url")) {
+                val raw = frame.attr(attr).trim()
+                if (raw.isEmpty() || raw.startsWith("javascript:", true)) continue
+                val url = try { URI(page).resolve(raw).toASCIIString() } catch (_: Exception) { continue }
+                if (isSupportedVideoEmbed(url)) return@withContext autoplayEmbedUrl(url)
+            }
+        }
+        // If the site temporarily removes its player, report failure rather than opening ads.
+        null
+    } catch (_: Exception) { null }
+}
+
+private fun isAllowedPlayerNavigation(target: Uri, initialPlayerUrl: String): Boolean {
+    if (target.toString() == "about:blank") return true
+    if (target.scheme != "https" || isAdHost(target.host)) return false
+    val main = Uri.parse(initialPlayerUrl)
+    val host = target.host?.lowercase()?.removePrefix("www.") ?: return false
+    val initial = main.host?.lowercase()?.removePrefix("www.") ?: return false
+    // Prevent a popup ad or script from replacing the video with a scam website.
+    // Same-provider redirects are permitted, but cross-provider top-level pages are not.
+    return host == initial || host.endsWith(".$initial")
 }
 
 
@@ -484,6 +543,21 @@ private fun App() {
     var chosenEpisode by remember { mutableStateOf<Episode?>(null) }
     var episodeLoading by remember { mutableStateOf(false) }
     var playRequested by remember { mutableStateOf(false) }
+    var playbackAttempt by remember { mutableIntStateOf(0) }
+    var safePlayerUrl by remember { mutableStateOf<String?>(null) }
+    var playerLoading by remember { mutableStateOf(false) }
+    var playerFailed by remember { mutableStateOf(false) }
+    LaunchedEffect(selected?.url, resumeUrl, playRequested, playbackAttempt) {
+        safePlayerUrl = null
+        playerFailed = false
+        playerLoading = playRequested && selected != null
+        if (playRequested && selected != null) {
+            val requestedPage = resumeUrl ?: selected!!.url
+            safePlayerUrl = findSafeVideoEmbed(requestedPage)
+            playerFailed = safePlayerUrl == null
+        }
+        playerLoading = false
+    }
     LaunchedEffect(selected?.url) {
         val film = selected
         episodes = emptyList(); chosenEpisode = null; chosenSeason = 1; playRequested = false
@@ -499,6 +573,8 @@ private fun App() {
     var history by remember { mutableStateOf(readHistory(prefs)) }
     fun openFilm(film: Film, resume: Boolean = false) {
         resumeUrl = if (resume) history[film.url]?.lastPage else null
+        playRequested = false
+        (context as? MainActivity)?.attachCursor(null)
         selected = film
         val previous = history[film.url]
         history = history + (film.url to WatchEntry(film.url, film.title, film.poster, film.type,
@@ -512,7 +588,7 @@ private fun App() {
         Column(Modifier.fillMaxSize().background(bg)) {
             Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween) {
-                Text("PersianRubinFilm v0.9", color = red, fontWeight = FontWeight.Bold, fontSize = if (isTv) 29.sp else 22.sp)
+                Text("PersianRubinFilm v0.10", color = red, fontWeight = FontWeight.Bold, fontSize = if (isTv) 29.sp else 22.sp)
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     if (selected == null) {
                         if (searchOpen) {
@@ -534,8 +610,9 @@ private fun App() {
                 val film = selected!!
                 TextButton(modifier = Modifier.tvFocus(), onClick = { selected = null; resumeUrl = null }) { Text(label("← Back", "بازگشت ←")) }
                 Text(film.title, Modifier.padding(horizontal = 16.dp, vertical = 8.dp), color = Color.White, fontSize = 22.sp)
-                Text(label("Playback uses the source site's own page/player. Availability and permissions depend on the provider.",
-                    "پخش از صفحه و پخش‌کنندهٔ سایت اصلی انجام می‌شود."), Modifier.padding(16.dp), color = Color.LightGray)
+                Text(label("Play opens the video provider directly, without loading the advertising-filled website. The video host may still require one tap to start.",
+                    "پخش مستقیماً از پخش‌کنندهٔ ویدئو باز می‌شود. ممکن است یک بار لمس برای شروع لازم باشد."),
+                    Modifier.padding(16.dp), color = Color.LightGray)
                 if (film.type == "series") {
                     if (episodeLoading) CircularProgressIndicator(Modifier.padding(12.dp))
                     else if (episodes.isEmpty()) {
@@ -565,7 +642,18 @@ private fun App() {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Button(modifier = Modifier.padding(start = 16.dp).tvFocus(),
                         enabled = film.type != "series" || episodes.isEmpty() || chosenEpisode != null,
-                        onClick = { resumeUrl = chosenEpisode?.url ?: film.url; playRequested = true }) {
+                        onClick = {
+                            val episodePage = chosenEpisode?.url ?: film.url
+                            resumeUrl = episodePage
+                            val previous = history[film.url]
+                            if (previous != null) {
+                                history = history + (film.url to previous.copy(lastPage = episodePage,
+                                    visitedAt = System.currentTimeMillis()))
+                                writeHistory(prefs, history)
+                            }
+                            playRequested = true
+                            playbackAttempt++
+                        }) {
                         Text(label("▶ Play", "▶ پخش"))
                     }
                     TextButton(modifier = Modifier.tvFocus(), onClick = {
@@ -574,7 +662,7 @@ private fun App() {
                 }
                 val lastPage = history[film.url]?.lastPage
                 if (lastPage != null && lastPage != film.url) {
-                    TextButton(onClick = { resumeUrl = lastPage }) {
+                    TextButton(onClick = { resumeUrl = lastPage; playRequested = true; playbackAttempt++ }) {
                         Text(label("Open last visited episode/page", "باز کردن آخرین قسمت / صفحه"))
                     }
                 }
@@ -584,22 +672,40 @@ private fun App() {
                 }) { Text(if (history[film.url]?.completed == true) label("✓ Watched (tap to undo)", "✓ دیده‌شده")
                     else label("Mark watched", "علامت‌گذاری به عنوان دیده‌شده")) }
                 if (!playRequested) {
-                    Text(label("Press Play to open this title.", "برای باز کردن پخش، دکمه پخش را بزنید."),
+                    Text(label("Press Play to load the video, not the source website.",
+                        "برای بارگیری ویدئو، پخش را بزنید."),
                         Modifier.padding(16.dp), color = Color.LightGray)
-                }
-                if (playRequested) key(film.url, resumeUrl) {
+                } else if (playerLoading) {
+                    Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                        CircularProgressIndicator(modifier = Modifier.size(24.dp))
+                        Text(label("  Finding the video player…", "  در حال پیدا کردن پخش‌کننده…"),
+                            color = Color.White)
+                    }
+                } else if (playerFailed) {
+                    Column(Modifier.padding(16.dp)) {
+                        Text(label("No supported video player was found for this title/episode. The unsafe source page was not opened.",
+                            "پخش‌کنندهٔ قابل‌استفاده پیدا نشد. صفحهٔ ناامن باز نشد."),
+                            color = Color.LightGray)
+                        TextButton(modifier = Modifier.tvFocus(), onClick = { playbackAttempt++ }) {
+                            Text(label("Retry video", "تلاش دوباره"))
+                        }
+                    }
+                } else if (safePlayerUrl != null) key(film.url, safePlayerUrl, playbackAttempt) {
+                    val embedUrl = safePlayerUrl!!
                     AndroidView(factory = { ctx ->
                         TvCursorFrame(ctx).apply {
                           (context as? MainActivity)?.attachCursor(this)
                           browser.apply {
                             settings.javaScriptEnabled = true
                             settings.domStorageEnabled = true
+                            settings.loadsImagesAutomatically = true
                             settings.javaScriptCanOpenWindowsAutomatically = false
                             isFocusable = true
                             isFocusableInTouchMode = true
                             settings.setSupportMultipleWindows(false)
                             settings.mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
-                            settings.mediaPlaybackRequiresUserGesture = true
+                            // Allows Play to start the embedded video without a second Android WebView gesture.
+                            settings.mediaPlaybackRequiresUserGesture = false
                             CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
                             webChromeClient = object : WebChromeClient() {
                                 override fun onCreateWindow(view: WebView?, isDialog: Boolean,
@@ -615,22 +721,19 @@ private fun App() {
                                 }
                                 override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
                                     val requestUri = request?.url ?: return true
-                                    if (!request.isForMainFrame) return false // embedded players can load their own frames
-                                    return !isAllowedNavigation(requestUri, Uri.parse(BASE).host ?: "www.diycraftsguide.com")
+                                    if (!request.isForMainFrame) return false // CDN/subframes needed for video.
+                                    return !isAllowedPlayerNavigation(requestUri, embedUrl)
                                 }
                                 override fun onPageFinished(view: WebView?, url: String?) {
                                     super.onPageFinished(view, url)
-                                    if (view != null) suppressPageOverlays(view)
-                                    if (url != null && isAllowedNavigation(Uri.parse(url), Uri.parse(BASE).host ?: "www.diycraftsguide.com")) {
-                                        val old = history[film.url]
-                                        if (old != null && old.lastPage != url) {
-                                            history = history + (film.url to old.copy(lastPage = url, visitedAt = System.currentTimeMillis()))
-                                            writeHistory(prefs, history)
-                                        }
-                                    }
+                                    // The host player is loaded directly; do not inject the source-site DOM/ad scripts.
+                                    view?.evaluateJavascript("""(function(){
+                                        var v=document.querySelector('video');
+                                        if(v){v.autoplay=true;var p=v.play();if(p&&p.catch)p.catch(function(){});}
+                                    })();""", null)
                                 }
                             }
-                            loadUrl(resumeUrl ?: film.url)
+                            loadUrl(embedUrl, mapOf("Referer" to (resumeUrl ?: film.url)))
                           }
                         }
                     }, modifier = Modifier.fillMaxWidth().weight(1f),
