@@ -288,45 +288,81 @@ internal class TvCursorFrame(context: android.content.Context) : FrameLayout(con
     }
 }
 
-// Only accept links with an unambiguous season AND episode designation.
-// Do not infer a season from arbitrary URL numbers, generic navigation, or episode-only links.
+// Series pages list each episode under a separate Season heading. Episode links are
+// often just "E01", "E02", etc., and point to the SAME /watch/...html page with
+// a different ?key= value. Do not try to read season numbers out of those URLs.
+private fun westernDigits(raw: String): String = buildString(raw.length) {
+    for (ch in raw) append(when (ch) {
+        in '۰'..'۹' -> ('0'.code + (ch.code - '۰'.code)).toChar()
+        in '٠'..'٩' -> ('0'.code + (ch.code - '٠'.code)).toChar()
+        else -> ch
+    })
+}
+
+private val seasonHeadingPattern = Regex(
+    """^(?:season|فصل)\s*[:#\-–.]?\s*(\d{1,2})\s*$""",
+    RegexOption.IGNORE_CASE
+)
+private val episodeLabelPattern = Regex(
+    """^(?:(?:playing\s*\.*|now\s+playing)\s*)?(?:episode|ep\.?|e|قسمت)\s*[:#\-.\s]*(\d{1,3})(?:\s*[-–—]\s*(?:end|final|آخر))?\s*$""",
+    RegexOption.IGNORE_CASE
+)
+
+private fun seasonHeading(raw: String): Int? = seasonHeadingPattern
+    .matchEntire(westernDigits(raw).replace(Regex("""\s+"""), " ").trim())
+    ?.groupValues?.getOrNull(1)?.toIntOrNull()?.takeIf { it in 1..50 }
+
+private fun episodeLabel(raw: String): Int? = episodeLabelPattern
+    .matchEntire(westernDigits(raw).replace(Regex("""\s+"""), " ").trim())
+    ?.groupValues?.getOrNull(1)?.toIntOrNull()?.takeIf { it in 1..300 }
+
 private suspend fun fetchEpisodes(film: Film): List<Episode> = withContext(Dispatchers.IO) {
     if (film.type != "series") return@withContext emptyList()
     try {
-        val doc = Jsoup.connect(film.url).userAgent("Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36")
-            .referrer(HOME).timeout(14000).get()
-        val found = linkedMapOf<String, Episode>()
-        // Require both numbers to appear together, in order, in the link title or URL slug.
-        // Avoid single-letter s/e regexes, which matched unrelated URL fragments (e.g. s16).
-        val seasonThenEpisode = Regex(
-            """(?:season|فصل)[\s._:/\-]*(\d{1,2})[\s._:/\-]*(?:episode|ep\.?|قسمت)[\s._:/\-]*(\d{1,3})""",
-            RegexOption.IGNORE_CASE
-        )
-        val episodeThenSeason = Regex(
-            """(?:episode|ep\.?|قسمت)[\s._:/\-]*(\d{1,3})[\s._:/\-]*(?:season|فصل)[\s._:/\-]*(\d{1,2})""",
-            RegexOption.IGNORE_CASE
-        )
-        val compact = Regex("""(?<![a-z0-9])s(\d{1,2})[._\- ]*e(\d{1,3})(?![a-z0-9])""", RegexOption.IGNORE_CASE)
+        val doc = Jsoup.connect(film.url)
+            .userAgent("Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120.0 Mobile Safari/537.36")
+            .referrer(HOME).timeout(16000).get()
+        val baseUri = URI(film.url)
         val siteHost = URI(BASE).host
-        for (a in doc.select("a[href]")) {
-            val url = a.absUrl("href")
-            val uri = try { URI(url) } catch (_: Exception) { continue }
-            if (uri.scheme != "https" || !uri.host.equals(siteHost, true)) continue
-            if (uri.path.isNullOrBlank() || uri.path == URI(film.url).path) continue
-            val visible = listOf(a.text(), a.attr("title"), a.attr("aria-label"))
-                .filter { it.isNotBlank() }.joinToString(" ").trim()
-            val slug = uri.path.substringAfterLast('/').substringBeforeLast('.').replace('-', ' ').replace('_', ' ')
-            // Prefer the explicit visible label. A slug is only used if it contains BOTH labels.
-            val matchText = listOf(visible, slug).firstNotNullOfOrNull { label ->
-                seasonThenEpisode.find(label)?.let { it.groupValues[1].toIntOrNull() to it.groupValues[2].toIntOrNull() }
-                    ?: episodeThenSeason.find(label)?.let { it.groupValues[2].toIntOrNull() to it.groupValues[1].toIntOrNull() }
-                    ?: compact.find(label)?.let { it.groupValues[1].toIntOrNull() to it.groupValues[2].toIntOrNull() }
-            } ?: continue
-            val (season, number) = matchText
-            if (season == null || number == null || season !in 1..30 || number !in 1..200) continue
-            // Keep only one entry per real season/episode combination.
-            val key = "$season:$number"
-            found.putIfAbsent(key, Episode(season, number, "Season $season Episode $number", url))
+        val found = linkedMapOf<String, Episode>()
+        var currentSeason: Int? = null
+
+        // Jsoup's getAllElements() visits the DOM in document order. Reading the
+        // explicit Season headings as we pass them associates E01...E20 with
+        // their actual group, including when the same episode number is reused
+        // by two different seasons.
+        for (element in doc.getAllElements()) {
+            // ownText() avoids merging a complete season's episode links into
+            // the parent heading, which could produce spurious numbers.
+            val heading = seasonHeading(element.ownText())
+                ?: element.attr("data-season").toIntOrNull()?.takeIf {
+                    it in 1..50 && element.tagName() != "a"
+                }
+            if (heading != null) currentSeason = heading
+
+            if (element.tagName() != "a") continue
+            // "Playing.. E12", "E09", "E13 - End", "Episode 4" and Persian
+            // episode labels all mean the same thing, but "25 EPISODES" does not.
+            val episodeNumber = episodeLabel(element.text())
+                ?: episodeLabel(element.attr("title"))
+                ?: episodeLabel(element.attr("aria-label"))
+                ?: continue
+            val link = element.absUrl("href")
+            val uri = try { URI(link) } catch (_: Exception) { continue }
+            if (uri.scheme != "https" || !uri.host.equals(siteHost, true) ||
+                !uri.path.orEmpty().startsWith("/watch/") ||
+                !uri.path.orEmpty().endsWith(".html")) continue
+            // Episode links can differ ONLY by ?key=... . Keep this query: it
+            // is what makes the selected episode play instead of the default one.
+            if (uri.path == baseUri.path && uri.rawQuery.isNullOrBlank() &&
+                uri.rawFragment != null) continue
+
+            // When no explicit season heading exists, keep the episode under a
+            // neutral "Episodes" group (season=0), rather than invent Season 1.
+            val season = currentSeason ?: 0
+            val key = "$season:$episodeNumber"
+            found.putIfAbsent(key, Episode(season, episodeNumber,
+                if (season == 0) "Episode $episodeNumber" else "Season $season Episode $episodeNumber", link))
         }
         found.values.sortedWith(compareBy<Episode> { it.season }.thenBy { it.number })
     } catch (_: Exception) { emptyList() }
@@ -609,7 +645,7 @@ private fun App() {
         Column(Modifier.fillMaxSize().background(bg)) {
             Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween) {
-                Text("PersianRubinFilm v0.10.1", color = red, fontWeight = FontWeight.Bold, fontSize = if (isTv) 29.sp else 22.sp)
+                Text("PersianRubinFilm v0.10.2", color = red, fontWeight = FontWeight.Bold, fontSize = if (isTv) 29.sp else 22.sp)
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     if (selected == null) {
                         if (searchOpen) {
@@ -637,15 +673,15 @@ private fun App() {
                 if (film.type == "series") {
                     if (episodeLoading) CircularProgressIndicator(Modifier.padding(12.dp))
                     else if (episodes.isEmpty()) {
-                        Text(label("No episode links detected. Open the source series page below to select an episode.",
-                            "فهرست قسمت‌ها پیدا نشد؛ قسمت را در صفحه اصلی انتخاب کنید."),
+                        Text(label("No selectable episode links were found on the source page for this series.",
+                            "پیوند قابل‌استفاده برای قسمت‌های این سریال پیدا نشد."),
                             Modifier.padding(horizontal = 16.dp), color = Color.LightGray)
                     } else {
                         Text(label("Choose season", "انتخاب فصل"), Modifier.padding(horizontal = 16.dp), color = Color.White)
                         LazyRow(Modifier.fillMaxWidth(), contentPadding = PaddingValues(horizontal = 12.dp)) {
                             items(episodes.map { it.season }.distinct()) { season ->
                                 TextButton(modifier = Modifier.tvFocus(), onClick = { chosenSeason = season; chosenEpisode = null }) {
-                                    Text(label("Season $season", "فصل $season"),
+                                    Text(if (season == 0) label("Episodes", "قسمت‌ها") else label("Season $season", "فصل $season"),
                                         color = if (chosenSeason == season) red else Color.White)
                                 }
                             }
