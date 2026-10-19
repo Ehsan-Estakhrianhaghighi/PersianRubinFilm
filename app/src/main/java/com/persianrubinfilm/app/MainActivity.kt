@@ -282,19 +282,46 @@ internal class TvCursorFrame(context: android.content.Context) : FrameLayout(con
         dot.invalidate()
         return true
     }
+    // A real Fire TV key must reach the Chromium player if its HTMLMediaElement
+    // is hidden behind the provider's implementation. JS from a WebView cannot
+    // inspect cross-origin iframes, so this has a native keyboard fallback.
     fun toggleVideoPlayback() {
-        // This works for HTML5 videos in the player document. Cross-origin iframe
-        // controls still require mouse mode and the provider's own control bar.
         browser.evaluateJavascript("""(function(){
-            var v=document.querySelector('video');
-            if(!v)return 'external-player';
-            if(v.paused){var p=v.play();if(p&&p.catch)p.catch(function(){});}else{v.pause();}
-            return 'ok';
-        })();""", null)
+            function videos(root) {
+                var found = [];
+                try {
+                    found.push.apply(found,root.querySelectorAll('video'));
+                    root.querySelectorAll('*').forEach(function(el){
+                        if(el.shadowRoot) found.push.apply(found,videos(el.shadowRoot));
+                        if(el.tagName==='IFRAME') {
+                            try { if(el.contentDocument) found.push.apply(found,videos(el.contentDocument)); }
+                            catch(e) { /* Cross-origin frame: handle via native key */ }
+                        }
+                    });
+                } catch(e) {}
+                return found;
+            }
+            var all = videos(document);
+            var active = all.find(function(v){return v.readyState>0 && !v.ended;}) || all[0];
+            if(!active) return 'unavailable';
+            try {
+                if(active.paused) { var p=active.play(); if(p&&p.catch)p.catch(function(){}); }
+                else active.pause();
+                return 'handled';
+            } catch(e) { return 'unavailable'; }
+        })();""") { result ->
+            if (result != "\"handled\"") {
+                // VK's web player often handles the physical Space shortcut even
+                // though it does not expose a <video> element to host JavaScript.
+                browser.requestFocus()
+                val downTime = android.os.SystemClock.uptimeMillis()
+                browser.dispatchKeyEvent(KeyEvent(downTime, downTime, KeyEvent.ACTION_DOWN,
+                    KeyEvent.KEYCODE_SPACE, 0))
+                browser.dispatchKeyEvent(KeyEvent(downTime, downTime + 30L, KeyEvent.ACTION_UP,
+                    KeyEvent.KEYCODE_SPACE, 0))
+            }
+        }
     }
-    // Full-screen TV interaction: OK first toggles an accessible HTML5 video;
-    // for a cross-origin hosted player, it taps the player center instead.
-    // Subsequent D-pad navigation moves a cursor over the provider's real controls.
     private var playerSelectionStarted = false
     fun resetRemoteSelection() {
         playerSelectionStarted = false
@@ -309,28 +336,10 @@ internal class TvCursorFrame(context: android.content.Context) : FrameLayout(con
             cursorY = height / 2f
             enabled = true
             dot.invalidate()
-            browser.evaluateJavascript("""(function(){
-                var v=document.querySelector('video');
-                if(!v)return 'external-player';
-                if(v.paused){var p=v.play();if(p&&p.catch)p.catch(function(){});}else{v.pause();}
-                return 'ok';
-            })();""") { result ->
-                if (result != "\"ok\"") click() // third-party iframe: tap to show/toggle its controls
-            }
-        } else {
-            // Selecting the central playback area again means Play/Pause;
-            // selecting a moved cursor position clicks the provider's control.
-            val nearCenter = kotlin.math.abs(cursorX - width / 2f) < 36f * resources.displayMetrics.density &&
-                kotlin.math.abs(cursorY - height / 2f) < 36f * resources.displayMetrics.density
-            if (nearCenter) {
-                browser.evaluateJavascript("""(function(){
-                    var v=document.querySelector('video');
-                    if(!v)return 'external-player';
-                    if(v.paused){var p=v.play();if(p&&p.catch)p.catch(function(){});}else{v.pause();}
-                    return 'ok';
-                })();""") { result -> if (result != "\"ok\"") click() }
-            } else click()
         }
+        val nearCenter = kotlin.math.abs(cursorX - width / 2f) < 36f * resources.displayMetrics.density &&
+            kotlin.math.abs(cursorY - height / 2f) < 36f * resources.displayMetrics.density
+        if (nearCenter) toggleVideoPlayback() else click()
     }
     fun playerDirection(direction: Int): Boolean {
         if (!playerSelectionStarted) return false
@@ -597,12 +606,15 @@ class MainActivity : ComponentActivity() {
     private var mouseEnabled = false
     private var detailScroll: ((Int) -> Unit)? = null
     private var fullscreenRemote = false
+    internal fun isFullscreenRemote() = fullscreenRemote
     internal fun setFullscreenRemote(value: Boolean) {
         fullscreenRemote = value
         if (value) {
             mouseEnabled = false
             tvCursor?.resetRemoteSelection()
         } else {
+            // Release native WebView focus so the Fire TV D-pad returns to Compose.
+            tvCursor?.browser?.clearFocus()
             tvCursor?.resetRemoteSelection()
         }
     }
@@ -635,7 +647,7 @@ class MainActivity : ComponentActivity() {
             if (event.keyCode == KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE ||
                 event.keyCode == KeyEvent.KEYCODE_MEDIA_PLAY ||
                 event.keyCode == KeyEvent.KEYCODE_MEDIA_PAUSE) {
-                if (event.action == KeyEvent.ACTION_UP) tvCursor?.playerOk()
+                if (event.action == KeyEvent.ACTION_UP) tvCursor?.toggleVideoPlayback()
                 return true
             }
             if (event.keyCode == KeyEvent.KEYCODE_MENU) {
@@ -700,8 +712,12 @@ private fun SafeEmbeddedPlayer(embedUrl: String, referer: String, modifier: Modi
                             settings.domStorageEnabled = true
                             settings.loadsImagesAutomatically = true
                             settings.javaScriptCanOpenWindowsAutomatically = false
-                            isFocusable = true
-                            isFocusableInTouchMode = true
+                            // Outside fullscreen the native browser must not steal TV focus
+                            // from the season list, Play, Back or scrolling detail page.
+                            // Touch input still works on phones.
+                            val fullscreen = (context as? MainActivity)?.isFullscreenRemote() == true
+                            isFocusable = fullscreen
+                            isFocusableInTouchMode = fullscreen
                             settings.setSupportMultipleWindows(false)
                             settings.mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
                             // Allows Play to start the embedded video without a second Android WebView gesture.
@@ -824,7 +840,7 @@ private fun App() {
         } else Column(Modifier.fillMaxSize().background(bg)) {
             Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween) {
-                Text("PersianRubinFilm v0.10.5", color = red, fontWeight = FontWeight.Bold, fontSize = if (isTv) 29.sp else 22.sp)
+                Text("PersianRobinFilm", color = red, fontWeight = FontWeight.Bold, fontSize = if (isTv) 29.sp else 22.sp)
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     if (selected == null) {
                         if (searchOpen) {
@@ -848,6 +864,14 @@ private fun App() {
                 // focus; its D-pad events otherwise never reach this Compose Column.
                 val detailScrollState = rememberScrollState()
                 val detailScrollScope = rememberCoroutineScope()
+                val playFocusRequester = remember { FocusRequester() }
+                LaunchedEffect(playerFullscreen, playRequested) {
+                    if (isTv && !playerFullscreen && playRequested) {
+                        // When full screen closes, the remote must land on a REAL
+                        // Compose control, not inside the embedded WebView.
+                        runCatching { playFocusRequester.requestFocus() }
+                    }
+                }
                 DisposableEffect(film.url, playerFullscreen) {
                     (context as? MainActivity)?.setDetailScroll { direction ->
                         detailScrollScope.launch {
@@ -890,7 +914,7 @@ private fun App() {
                     }
                 }
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Button(modifier = Modifier.padding(start = 16.dp).tvFocus(),
+                    Button(modifier = Modifier.padding(start = 16.dp).focusRequester(playFocusRequester).tvFocus(),
                         enabled = film.type != "series" || episodes.isEmpty() || chosenEpisode != null,
                         onClick = {
                             val episodePage = chosenEpisode?.url ?: film.url
@@ -954,19 +978,6 @@ private fun App() {
                         referer = resumeUrl ?: film.url,
                         modifier = Modifier.fillMaxWidth().height(if (isTv) 450.dp else 310.dp)
                     )
-                }
-                if (isTv) {
-                    Row(Modifier.fillMaxWidth().padding(12.dp), horizontalArrangement = Arrangement.SpaceBetween) {
-                        TextButton(modifier = Modifier.tvFocus(), onClick = {
-                            detailScrollScope.launch { detailScrollState.animateScrollTo(0) }
-                        }) { Text("↑ Top") }
-                        TextButton(modifier = Modifier.tvFocus(), onClick = {
-                            detailScrollScope.launch { detailScrollState.animateScrollTo(detailScrollState.maxValue) }
-                        }) { Text("↓ Video / Bottom") }
-                        TextButton(modifier = Modifier.tvFocus(), onClick = {
-                            (context as? MainActivity)?.toggleVideoPlayback()
-                        }) { Text("⏯ Play/Pause") }
-                    }
                 }
                 } // Scrollable detail area
             } else {
