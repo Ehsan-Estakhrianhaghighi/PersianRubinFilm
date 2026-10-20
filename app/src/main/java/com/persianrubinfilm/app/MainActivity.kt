@@ -244,15 +244,15 @@ internal class TvCursorFrame(context: android.content.Context) : FrameLayout(con
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = android.graphics.Color.RED
         style = Paint.Style.STROKE
-        strokeWidth = 4f * resources.displayMetrics.density
+        strokeWidth = 2f * resources.displayMetrics.density
     }
     private val dot = object : View(context) {
         override fun onDraw(canvas: Canvas) {
             super.onDraw(canvas)
             if (!enabled) return
-            canvas.drawCircle(cursorX, cursorY, 11f * resources.displayMetrics.density, paint)
-            canvas.drawLine(cursorX - 18f, cursorY, cursorX + 18f, cursorY, paint)
-            canvas.drawLine(cursorX, cursorY - 18f, cursorX, cursorY + 18f, paint)
+            canvas.drawCircle(cursorX, cursorY, 7f * resources.displayMetrics.density, paint)
+            canvas.drawLine(cursorX - 12f * resources.displayMetrics.density, cursorY, cursorX + 12f * resources.displayMetrics.density, cursorY, paint)
+            canvas.drawLine(cursorX, cursorY - 12f * resources.displayMetrics.density, cursorX, cursorY + 12f * resources.displayMetrics.density, paint)
         }
     }
     init {
@@ -267,9 +267,16 @@ internal class TvCursorFrame(context: android.content.Context) : FrameLayout(con
         if (cursorY == 0f) cursorY = height / 2f
         dot.invalidate()
     }
-    fun move(direction: Int): Boolean {
+    fun move(direction: Int, repeatCount: Int = 0): Boolean {
         if (!enabled) return false
-        val step = 32f * resources.displayMetrics.density
+        // One tap: precise 10dp movement for small player icons.
+        // Hold an arrow: gradually accelerate so crossing a TV screen remains practical.
+        val distanceDp = when {
+            repeatCount >= 14 -> 42f
+            repeatCount >= 6 -> 24f
+            else -> 10f
+        }
+        val step = distanceDp * resources.displayMetrics.density
         when (direction) {
             KeyEvent.KEYCODE_DPAD_LEFT -> cursorX -= step
             KeyEvent.KEYCODE_DPAD_RIGHT -> cursorX += step
@@ -341,9 +348,9 @@ internal class TvCursorFrame(context: android.content.Context) : FrameLayout(con
             kotlin.math.abs(cursorY - height / 2f) < 36f * resources.displayMetrics.density
         if (nearCenter) toggleVideoPlayback() else click()
     }
-    fun playerDirection(direction: Int): Boolean {
+    fun playerDirection(direction: Int, repeatCount: Int = 0): Boolean {
         if (!playerSelectionStarted) return false
-        return move(direction)
+        return move(direction, repeatCount)
     }
     fun click(): Boolean {
         if (!enabled) return false
@@ -574,13 +581,46 @@ private suspend fun fetchCatalog(): List<Film> = withContext(Dispatchers.IO) {
                 if (category == "series" || old?.type == "series") "series" else "movie")
         }
     }
-    val pages = listOf(HOME to null, "$BASE/movies.html" to "movie", "$BASE/tv-series.html" to "series")
-    for ((page, category) in pages) {
-        try {
-            val doc = Jsoup.connect(page).userAgent(ua).referrer(HOME)
-                .timeout(16000).get()
-            parse(doc, category)
-        } catch (_: Exception) { /* Other catalog pages may still load. */ }
+    // The source homepage's "View More" links lead to /movies.html and /serial.html.
+    // Both catalogs use paginated paths such as /movies/2.html and /serial/2.html.
+    // Fetch the actual catalog rather than relying on its "Latest" home-page subset.
+    val categories = listOf("movie" to "movies", "series" to "serial")
+    suspend fun loadDocument(page: String): org.jsoup.nodes.Document? = try {
+        Jsoup.connect(page).userAgent(ua).referrer(HOME)
+            .timeout(12000).get()
+    } catch (_: Exception) { null }
+    loadDocument(HOME)?.let { parse(it) }
+    for ((category, slug) in categories) {
+        val firstPage = "$BASE/$slug.html"
+        val doc = loadDocument(firstPage) ?: continue
+        parse(doc, category)
+
+        // Find numbered pagination links from the category page, including its
+        // last-page / next-page links. Do not treat /watch/ links as pagination.
+        val pagePath = Regex("^/$slug/(\\d+)\\.html$")
+        fun numberedPages(page: org.jsoup.nodes.Document): List<Int> =
+            page.select("a[href]").mapNotNull { a ->
+                val uri = try { URI(a.absUrl("href")) } catch (_: Exception) { null }
+                if (uri?.host?.equals(URI(BASE).host, true) != true) null
+                else pagePath.matchEntire(uri.path.orEmpty())?.groupValues?.get(1)?.toIntOrNull()
+            }.filter { it in 2..80 }.distinct()
+
+        val queued = java.util.TreeSet<Int>()
+        queued.addAll(numberedPages(doc))
+        val attempted = mutableSetOf<Int>()
+        var processed = 0
+        var consecutiveFailures = 0
+        // Bounded crawling prevents a malformed pagination link from hanging startup.
+        while (queued.isNotEmpty() && processed < 80 && consecutiveFailures < 3) {
+            val number = queued.pollFirst() ?: break
+            if (!attempted.add(number)) continue
+            processed++
+            val next = loadDocument("$BASE/$slug/$number.html")
+            if (next == null) { consecutiveFailures++; continue }
+            consecutiveFailures = 0
+            parse(next, category)
+            queued.addAll(numberedPages(next).filter { it !in attempted })
+        }
     }
     // Individual detail pages contain poster metadata even when a list card does not.
     // Limit concurrent connections to avoid overwhelming the site or TV device.
@@ -641,7 +681,7 @@ class MainActivity : ComponentActivity() {
             }
             if (event.keyCode in listOf(KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_DOWN,
                 KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_DPAD_RIGHT)) {
-                if (event.action == KeyEvent.ACTION_DOWN) tvCursor?.playerDirection(event.keyCode)
+                if (event.action == KeyEvent.ACTION_DOWN) tvCursor?.playerDirection(event.keyCode, event.repeatCount)
                 return true
             }
             if (event.keyCode == KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE ||
@@ -684,7 +724,7 @@ class MainActivity : ComponentActivity() {
                 }
                 if (event.keyCode in listOf(KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_DOWN,
                     KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_DPAD_RIGHT)) {
-                    if (event.action == KeyEvent.ACTION_DOWN) tvCursor?.move(event.keyCode)
+                    if (event.action == KeyEvent.ACTION_DOWN) tvCursor?.move(event.keyCode, event.repeatCount)
                     return true
                 }
                 if (event.keyCode == KeyEvent.KEYCODE_DPAD_CENTER || event.keyCode == KeyEvent.KEYCODE_ENTER) {
@@ -711,6 +751,8 @@ private fun SafeEmbeddedPlayer(embedUrl: String, referer: String, modifier: Modi
                             settings.javaScriptEnabled = true
                             settings.domStorageEnabled = true
                             settings.loadsImagesAutomatically = true
+                            // Android WebView handles normal HTTP caching; this is not an offline-video download.
+                            settings.cacheMode = WebSettings.LOAD_DEFAULT
                             settings.javaScriptCanOpenWindowsAutomatically = false
                             // Outside fullscreen the native browser must not steal TV focus
                             // from the season list, Play, Back or scrolling detail page.
@@ -745,7 +787,7 @@ private fun SafeEmbeddedPlayer(embedUrl: String, referer: String, modifier: Modi
                                     // The host player is loaded directly; do not inject the source-site DOM/ad scripts.
                                     view?.evaluateJavascript("""(function(){
                                         var v=document.querySelector('video');
-                                        if(v){v.autoplay=true;var p=v.play();if(p&&p.catch)p.catch(function(){});}
+                                        if(v){v.preload="auto";v.autoplay=true;var p=v.play();if(p&&p.catch)p.catch(function(){});}
                                     })();""", null)
                                 }
                             }
