@@ -36,6 +36,7 @@ import coil.request.ImageRequest
 import coil.request.CachePolicy
 import android.webkit.WebChromeClient
 import androidx.activity.ComponentActivity
+import androidx.activity.OnBackPressedCallback
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.*
 import androidx.compose.foundation.layout.*
@@ -595,31 +596,61 @@ private suspend fun fetchCatalog(): List<Film> = withContext(Dispatchers.IO) {
         val doc = loadDocument(firstPage) ?: continue
         parse(doc, category)
 
-        // Find numbered pagination links from the category page, including its
-        // last-page / next-page links. Do not treat /watch/ links as pagination.
-        val pagePath = Regex("^/$slug/(\\d+)\\.html$")
-        fun numberedPages(page: org.jsoup.nodes.Document): List<Int> =
-            page.select("a[href]").mapNotNull { a ->
-                val uri = try { URI(a.absUrl("href")) } catch (_: Exception) { null }
-                if (uri?.host?.equals(URI(BASE).host, true) != true) null
-                else pagePath.matchEntire(uri.path.orEmpty())?.groupValues?.get(1)?.toIntOrNull()
-            }.filter { it in 2..80 }.distinct()
+        if (category == "series") {
+            // Series pagination is NOT /serial/2.html, /serial/3.html, etc.
+            // The website's actual View More catalog uses /tv-series/24.html,
+            // /tv-series/48.html, ... (offsets), even though page one is /serial.html.
+            // Discover the real hrefs on each page rather than generating page numbers.
+            val pagePath = Regex("^/tv-series/(\\d+)\\.html$")
+            fun seriesPages(page: org.jsoup.nodes.Document): List<Int> =
+                page.select("a[href]").mapNotNull { a ->
+                    val uri = try { URI(a.absUrl("href")) } catch (_: Exception) { null }
+                    if (uri?.host?.equals(URI(BASE).host, true) != true) null
+                    else pagePath.matchEntire(uri.path.orEmpty())
+                        ?.groupValues?.get(1)?.toIntOrNull()
+                }.filter { it in 1..2400 }.distinct()
 
-        val queued = java.util.TreeSet<Int>()
-        queued.addAll(numberedPages(doc))
-        val attempted = mutableSetOf<Int>()
-        var processed = 0
-        var consecutiveFailures = 0
-        // Bounded crawling prevents a malformed pagination link from hanging startup.
-        while (queued.isNotEmpty() && processed < 80 && consecutiveFailures < 3) {
-            val number = queued.pollFirst() ?: break
-            if (!attempted.add(number)) continue
-            processed++
-            val next = loadDocument("$BASE/$slug/$number.html")
-            if (next == null) { consecutiveFailures++; continue }
-            consecutiveFailures = 0
-            parse(next, category)
-            queued.addAll(numberedPages(next).filter { it !in attempted })
+            val queued = java.util.TreeSet<Int>()
+            queued.addAll(seriesPages(doc))
+            val attempted = mutableSetOf<Int>()
+            var processed = 0
+            var consecutiveFailures = 0
+            while (queued.isNotEmpty() && processed < 100 && consecutiveFailures < 4) {
+                val offset = queued.pollFirst() ?: break
+                if (!attempted.add(offset)) continue
+                processed++
+                val page = loadDocument("$BASE/tv-series/$offset.html")
+                if (page == null) { consecutiveFailures++; continue }
+                consecutiveFailures = 0
+                parse(page, category)
+                queued.addAll(seriesPages(page).filter { it !in attempted })
+            }
+        } else {
+            // Preserve the existing, working movie pagination unchanged.
+            val pagePath = Regex("^/$slug/(\\d+)\\.html$")
+            fun numberedPages(page: org.jsoup.nodes.Document): List<Int> =
+                page.select("a[href]").mapNotNull { a ->
+                    val uri = try { URI(a.absUrl("href")) } catch (_: Exception) { null }
+                    if (uri?.host?.equals(URI(BASE).host, true) != true) null
+                    else pagePath.matchEntire(uri.path.orEmpty())
+                        ?.groupValues?.get(1)?.toIntOrNull()
+                }.filter { it in 2..80 }.distinct()
+
+            val queued = java.util.TreeSet<Int>()
+            queued.addAll(numberedPages(doc))
+            val attempted = mutableSetOf<Int>()
+            var processed = 0
+            var consecutiveFailures = 0
+            while (queued.isNotEmpty() && processed < 80 && consecutiveFailures < 3) {
+                val number = queued.pollFirst() ?: break
+                if (!attempted.add(number)) continue
+                processed++
+                val next = loadDocument("$BASE/$slug/$number.html")
+                if (next == null) { consecutiveFailures++; continue }
+                consecutiveFailures = 0
+                parse(next, category)
+                queued.addAll(numberedPages(next).filter { it !in attempted })
+            }
         }
     }
     // Individual detail pages contain poster metadata even when a list card does not.
@@ -646,6 +677,48 @@ class MainActivity : ComponentActivity() {
     private var mouseEnabled = false
     private var detailScroll: ((Int) -> Unit)? = null
     private var fullscreenRemote = false
+    // Web-based players such as VK Video request native custom-view fullscreen
+    // through WebChromeClient. Without this handler their own fullscreen icon
+    // does nothing even when the embedded video is otherwise playing.
+    private var providerFullscreenView: View? = null
+    private var providerFullscreenCallback: WebChromeClient.CustomViewCallback? = null
+    private var originalSystemUiVisibility: Int = 0
+    private val providerFullscreenBack = object : OnBackPressedCallback(false) {
+        override fun handleOnBackPressed() { hideProviderFullscreen() }
+    }
+    internal fun showProviderFullscreen(view: View, callback: WebChromeClient.CustomViewCallback) {
+        if (providerFullscreenView != null) {
+            callback.onCustomViewHidden()
+            return
+        }
+        val root = findViewById<FrameLayout>(android.R.id.content)
+        // A native player view is positioned over the Compose page and WebView.
+        (view.parent as? ViewGroup)?.removeView(view)
+        originalSystemUiVisibility = window.decorView.systemUiVisibility
+        providerFullscreenView = view
+        providerFullscreenCallback = callback
+        root.addView(view, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.MATCH_PARENT
+        ))
+        window.decorView.systemUiVisibility = originalSystemUiVisibility or
+            View.SYSTEM_UI_FLAG_FULLSCREEN or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
+            View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+        providerFullscreenBack.isEnabled = true
+        view.isFocusableInTouchMode = true
+        view.requestFocus()
+    }
+    internal fun hideProviderFullscreen() {
+        val playerView = providerFullscreenView ?: return
+        providerFullscreenView = null
+        val callback = providerFullscreenCallback
+        providerFullscreenCallback = null
+        providerFullscreenBack.isEnabled = false
+        (playerView.parent as? ViewGroup)?.removeView(playerView)
+        window.decorView.systemUiVisibility = originalSystemUiVisibility
+        callback?.onCustomViewHidden()
+        tvCursor?.browser?.requestFocus()
+    }
     internal fun isFullscreenRemote() = fullscreenRemote
     internal fun setFullscreenRemote(value: Boolean) {
         fullscreenRemote = value
@@ -670,6 +743,15 @@ class MainActivity : ComponentActivity() {
     }
     internal fun mouseModeEnabled() = mouseEnabled
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        // Native VK fullscreen must receive its own key events, not the
+        // underlying app's virtual cursor commands.
+        if (providerFullscreenView != null) {
+            if (event.keyCode == KeyEvent.KEYCODE_BACK) {
+                if (event.action == KeyEvent.ACTION_UP) hideProviderFullscreen()
+                return true
+            }
+            return super.dispatchKeyEvent(event)
+        }
         // The full-screen player captures remote keys before WebView consumes them.
         // No separate, unreachable Compose control bar is drawn over the video.
         if (fullscreenRemote && tvCursor != null) {
@@ -737,6 +819,7 @@ class MainActivity : ComponentActivity() {
     }
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        onBackPressedDispatcher.addCallback(this, providerFullscreenBack)
         setContent { App() }
     }
 }
@@ -768,6 +851,16 @@ private fun SafeEmbeddedPlayer(embedUrl: String, referer: String, modifier: Modi
                             webChromeClient = object : WebChromeClient() {
                                 override fun onCreateWindow(view: WebView?, isDialog: Boolean,
                                     isUserGesture: Boolean, resultMsg: Message?): Boolean = false
+                                override fun onShowCustomView(
+                                    view: View?, callback: WebChromeClient.CustomViewCallback?
+                                ) {
+                                    if (view == null || callback == null) return
+                                    (context as? MainActivity)?.showProviderFullscreen(view, callback)
+                                        ?: callback.onCustomViewHidden()
+                                }
+                                override fun onHideCustomView() {
+                                    (context as? MainActivity)?.hideProviderFullscreen()
+                                }
                             }
                             webViewClient = object : WebViewClient() {
                                 override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
